@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+data/
+__pycache__/
+.pytest_cache/
+.DS_Store
+.streamlit/secrets.toml
+*.duckdb
+*.tmp.duckdb
+# The published snapshot is what the hosted dashboard reads, so it is committed.
+!app_data/tracker.duckdb
