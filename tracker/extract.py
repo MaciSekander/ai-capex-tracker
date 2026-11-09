@@ -215,6 +215,35 @@ _SCALE = {
 }
 
 
+_SCALE_WORDS = {
+    # Tolerates PDF line-break artefacts ("bil-lion", "b n") and footnote marks ("$3.5Bn³").
+    "billion": re.compile(r"bil-?\s?lions?|(?<![a-z])b\s?n(?![a-z])|\d\s?b(?![a-z])", re.IGNORECASE),
+    "million": re.compile(r"mil-?\s?lions?|(?<![a-z])mm(?![a-z])|\d\s?m(?![a-z])", re.IGNORECASE),
+    "thousand": re.compile(r"\bthousands?\b", re.IGNORECASE),
+}
+
+
+def _bare_dollar_scales(quote: str, n: float) -> list[float]:
+    """Scales a number without its own unit word could carry, judged from the rest of the quote.
+
+    "$18 to $22 billion": the bare 18 takes "billion" from later in the quote. A table row with no
+    unit word anywhere is read as millions (how filings present tables) or, if very large, raw dollars.
+    A bare number is never assumed to be billions unless the quote says "billion" somewhere.
+    """
+    scales = []
+    if _SCALE_WORDS["billion"].search(quote):
+        scales.append(1.0)
+    if _SCALE_WORDS["million"].search(quote):
+        scales.append(1e-3)
+    if _SCALE_WORDS["thousand"].search(quote):
+        scales.append(1e-6)
+    if not scales:
+        scales.append(1e-3)
+        if n >= 1e6:
+            scales.append(1e-9)
+    return scales
+
+
 def numbers_in(quote: str, unit: str) -> list[float]:
     """Candidate canonical values for every number in the quote."""
     scales = _SCALE.get(unit, {None: 1.0})
@@ -223,8 +252,11 @@ def numbers_in(quote: str, unit: str) -> list[float]:
         n = float(raw.replace(",", ""))
         key = word.lower() if word else None
         if unit == "USD_billion" and key is None:
-            # Bare numbers in financial tables are usually in millions; raw dollars if very large.
-            out.extend([n, n / 1e3, n / 1e9])
+            out.extend(n * s for s in _bare_dollar_scales(quote, n))
+            continue
+        if key is not None and key not in scales:
+            # The number carries a unit of a different kind ("800 MW" for a dollar metric,
+            # "$14 billion" for a power metric), so it cannot support this fact.
             continue
         scale = scales.get(key, scales.get(None, 1.0))
         out.append(n * (scale if scale is not None else 1.0))

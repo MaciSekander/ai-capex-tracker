@@ -28,6 +28,11 @@ CONCEPTS = {
     ],
 }
 
+# Used only when a company reports none of the concepts above (Hut 8 tags capex this way).
+FALLBACK_CONCEPTS = {
+    "capex": [("us-gaap", "PaymentsToAcquireMachineryAndEquipment")],
+}
+
 QUARTER_DAYS = (80, 100)
 
 
@@ -89,14 +94,18 @@ def company_quarterly(facts: dict, ticker: str) -> pd.DataFrame:
     """Quarterly capex and operating cash flow for one company, in USD billions."""
     frames = []
     for metric, candidates in CONCEPTS.items():
-        best, best_end = None, None
-        for taxonomy, concept in candidates:
-            df = _facts_for(facts, taxonomy, concept)
-            if df.empty:
-                continue
-            latest = df["end"].max()
-            if best_end is None or latest > best_end:
-                best, best_end = (taxonomy, concept, df), latest
+        best = None
+        for tier in (candidates, FALLBACK_CONCEPTS.get(metric, [])):
+            best_end = None
+            for taxonomy, concept in tier:
+                df = _facts_for(facts, taxonomy, concept)
+                if df.empty:
+                    continue
+                latest = df["end"].max()
+                if best_end is None or latest > best_end:
+                    best, best_end = (taxonomy, concept, df), latest
+            if best is not None:
+                break
         if best is None:
             continue
         taxonomy, concept, df = best

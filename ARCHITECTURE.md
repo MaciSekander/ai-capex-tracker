@@ -10,8 +10,10 @@ SEC EDGAR ──► edgar.py ──► filings + document text ─┐
     └──► xbrl.py ──► quarterly capex & cash flow ────┤        │
                                                      │        ├─► streamlit_app.py (dashboard)
          extract.py ──► Claude ──► checked facts ────┘        └─► publish ──► app_data/ (hosted app)
-                         ▲
-                 pipeline.py runs each step from the command line
+                         ▲                                     │
+                 pipeline.py runs each step         analytics.py turns tables into dashboard views
+                                                    (dedup, guidance revisions, capex series),
+                                                    after app_data/corrections.csv is applied
 ```
 
 There are two kinds of data:
@@ -30,12 +32,16 @@ gpu-capex-tracker/
 │   ├── xbrl.py            Quarterly capex from XBRL data
 │   ├── extract.py         Claude extraction and the checks against the source
 │   ├── store.py           DuckDB tables, publish and export
+│   ├── analytics.py       Derived views for the dashboard (pure pandas)
 │   ├── pipeline.py        Command line entry point
 │   ├── evaluate.py        Human review and precision/recall
 │   └── demo.py            Fictional demo database
-├── tests/test_pipeline.py Offline tests (fake SEC and Claude responses)
+├── tests/
+│   ├── test_pipeline.py   Pipeline tests (fake SEC and Claude responses)
+│   └── test_analytics.py  Derived views, unit checks, and a render of every dashboard tab
+├── .streamlit/config.toml Dashboard theme
 ├── data/                  Full database and download cache (gitignored)
-└── app_data/              Slim database for the hosted dashboard (committed)
+└── app_data/              Slim database and corrections.csv for the hosted dashboard (committed)
 ```
 
 ### `tracker/config.py`: settings
@@ -74,7 +80,8 @@ Uses the SEC's XBRL "company facts" API, which carries the tagged financial stat
 
 - **The problem.** Cash flow statements in 10-Qs report year-to-date totals (three, six and nine months), not single quarters.
 - **`quarterly_series()`** gets single quarters back. A value that covers about one quarter (80 to 100 days) is used as reported. Otherwise it subtracts consecutive year-to-date values that share a start date: Q2 = first half − Q1, and Q4 = full year − nine months. Each row is marked `method = reported` or `method = derived`.
-- **`CONCEPTS`** lists fallback tag names, because companies tag capex differently (for example `PaymentsToAcquirePropertyPlantAndEquipment`, or an IFRS tag for Nebius). The tag with the most recent data is used.
+- **`CONCEPTS`** lists the tag names companies use for capex. The tag with the most recent data is used. **`FALLBACK_CONCEPTS`** is tried only when none of those exist (Hut 8 tags capex as `PaymentsToAcquireMachineryAndEquipment`).
+- Nebius files an annual 20-F, so it has no quarterly XBRL. The dashboard fills its quarters from press releases (see `analytics.py`).
 - When a period has been restated, the latest filing's value wins.
 
 ### `tracker/extract.py`: Claude extraction
@@ -85,7 +92,7 @@ Each document goes through three stages.
 2. **`call_model()`** sends each chunk to Claude. `SYSTEM_PROMPT` sets the rules: canonical units, ranges as low/high/midpoint, a verbatim quote of at most 300 characters, and never guessing. Claude replies by calling the `record_facts` tool, whose strict JSON schema fixes the output format. The system prompt is cached, so repeated calls cost less.
 3. **`ground()`** checks each fact against the source and gives it a status:
    - `quote_match()` checks the quote appears in the filing. It returns `exact` for a word-for-word match, `fuzzy` if at least 70% of the quote's three-word sequences appear, and `missing` otherwise.
-   - `value_match()` checks the number appears in the quote. It handles scaling ("$1.2 billion" = 1.2, "1.2 GW" = 1,200 MW) and accepts a range midpoint when both ends appear.
+   - `value_match()` checks the number appears in the quote **with a compatible unit**. It handles scaling ("$1.2 billion" = 1.2, "1.2 GW" = 1,200 MW) and accepts a range midpoint when both ends appear. A number carrying a unit of another kind never matches ("800 MW" cannot support an $800B contract). A number with no unit word takes its scale from the rest of the quote ("$18 to $22 billion"), or is read as millions in a table row, never as billions unless the quote says "billion". PDF artefacts such as "bil-lion" and "$3.5Bn³" are tolerated.
 
 | Status | Meaning |
 |---|---|
@@ -123,6 +130,7 @@ Each `python -m tracker.pipeline <command>` maps to one function.
 | `filings` | Downloads filings and exhibits and stores their text |
 | `extract` | Runs Claude on documents not yet extracted |
 | `run` | All of the above, in order |
+| `regrade` | Re-runs the source checks on every stored fact against its saved text. No API calls |
 | `status` | Row counts and extraction coverage by ticker |
 | `review-sheet`, `import-reviews`, `eval` | Human review workflow |
 | `publish` | Writes the slim database to `app_data/` |
@@ -141,23 +149,43 @@ The automatic checks catch made-up quotes and numbers, but not facts the model m
 2. A reviewer marks each fact `correct`, `incorrect` or `unsure`, and adds rows marked `missed` for facts the model skipped.
 3. `scores()` computes precision (the share of extracted facts that are right) and recall (the share of real facts that were found) for each metric. The dashboard's Data quality tab shows them.
 
+### `tracker/analytics.py`: dashboard views
+
+Pure pandas functions, tested in `tests/test_analytics.py`.
+
+- **`disclosures()`** merges repeated facts. Companies restate the same number in the release, the deck and later releases, so each distinct (company, metric, value, period, counterparty, site) is kept once, with `first_stated`, `last_stated` and `mentions`. Contracts and financings with the same company and amount stated within 180 days are treated as one deal, because deals are restated in different words.
+- **`period_label()`** normalizes periods ("FY2026", "fiscal 2026", "2026" → "2026"; "FY27 Q1" → "Q1 2027"). Open-ended periods ("over the next several years") return `None`.
+- **`guidance_history()`** orders each company's guidance for a period and labels every statement `initial`, `raised`, `lowered` or `maintained` from the numbers. A narrowed range counts as raised if its midpoint or an end moved up. The company's own wording is kept separately.
+- **`capex_quarterly()`** returns XBRL quarters plus press-release quarters for companies with no quarterly XBRL, with a `source` column.
+- **`capex_summary()` / `ttm_total()`** compute latest quarter, quarter-on-quarter, year-over-year and last four quarters. Four-quarter totals require four consecutive quarters.
+- **`latest_values()` / `metric_series()`** pick company-level figures (no site named; the largest value when a filing gives a total and its parts).
+- **`apply_corrections()`** drops facts listed in `app_data/corrections.csv`.
+
+### `app_data/corrections.csv`: manual corrections
+
+The checks prove a number was stated, not that it was classified correctly. A fact judged misclassified is listed here with `fact_id`, `action` (`exclude`), `reason` and `date`. The dashboard drops it everywhere and shows the list on the Methodology tab.
+
 ### `streamlit_app.py`: dashboard
 
-- **Data source (`pick_source`).** Uses `TRACKER_DB` if set, then `data/tracker.duckdb`, then `app_data/tracker.duckdb`, then the fictional demo database, which shows a warning banner. Results are cached for 10 minutes and reloaded when the file changes.
-- **Sidebar filters:** company type, companies, which check statuses to show (verified and partial by default), and a start date.
-- **Headline numbers:** hyperscaler capex over the last four quarters with year-over-year change, capex as a share of operating cash flow, neocloud and infrastructure capex, and how many recent guidance statements were raised.
+- **Data source (`pick_source`).** Uses `TRACKER_DB` if set, then `data/tracker.duckdb`, then `app_data/tracker.duckdb`, then the fictional demo database, which shows a warning banner.
+- **Sidebar filters:** company type, companies (empty means all), which check statuses to include (verified only by default) and a start date. Filters apply to every tab.
 - **Tabs:**
-  1. **Capex:** quarterly capex by company or stacked by group, plus capex ÷ operating cash flow over four quarters (above 100% means the spending is funded by cash on hand, debt or equity).
-  2. **Guidance:** each guidance statement as a range, with marker shape showing raised, lowered or reaffirmed.
-  3. **Capacity:** active, contracted and pipeline MW, GPUs deployed, and revenue backlog over time.
-  4. **Contracts & financing:** bubble charts sized by dollar value, and a table.
-  5. **Fact explorer:** every fact, searchable, with its quote and a link to the filing.
-  6. **Data quality:** check results and precision/recall.
+  1. **Overview:** headline numbers with explanations on hover, quarterly capex by company, the latest guidance per company, and *What's new*, every disclosure first stated in the last 7, 30 or 90 days.
+  2. **Capex:** quarterly capex for hyperscalers and smaller companies on separate scales, a scorecard (latest quarter, change on prior quarter and year, last four quarters, source) and capex ÷ operating cash flow.
+  3. **Guidance:** guidance statements over time with ranges and revision markers, and a revision log.
+  4. **Power & capacity:** latest active, contracted and (optionally) pipeline MW for neoclouds and AI infrastructure, one company's history, GPUs deployed and revenue backlog.
+  5. **Contracts & financing:** counts and the largest deal over 12 months (values are not summed, because deals are often "up to" amounts), bubble charts and a deal log.
+  6. **Company profile:** one company's capex, guidance, capacity, latest disclosure per metric and recent filings.
+  7. **All disclosures:** searchable list of every disclosure, or every mention, with CSV export including `fact_id`.
+  8. **Methodology:** how the data is built and checked, metric definitions, limitations, data quality, coverage by company and the manual corrections.
+- Every chart and table states its source and method beneath it, and every table links to the filing.
 
-### `tracker/demo.py` and `tests/test_pipeline.py`
+### `tracker/demo.py` and the tests
 
 - **`demo.py`** generates fictional companies, numbers and quotes so the dashboard can be tried before the pipeline runs.
-- **`test_pipeline.py`** has 18 tests that use fake SEC and Claude responses, so they need no network or API key. They cover HTML parsing, year-to-date differencing, the checks against the source (the fake Claude returns a made-up quote and a wrong number on purpose) and an end-to-end pipeline run. Run them with `.venv/bin/python -m pytest -q`.
+- **`test_pipeline.py`** uses fake SEC and Claude responses, so it needs no network or API key. It covers HTML parsing, year-to-date differencing, the checks against the source (the fake Claude returns a made-up quote and a wrong number on purpose) and an end-to-end pipeline run.
+- **`test_analytics.py`** covers period parsing, deduplication, deal merging, guidance revisions, the Nebius capex fill-in, consecutive-quarter totals, corrections, the unit-aware number check (with real cases that were wrongly verified before), and renders every dashboard tab and company profile on demo data.
+- Run everything with `.venv/bin/python -m pytest -q`.
 
 ## Viewing the database
 
@@ -198,8 +226,9 @@ SELECT ticker, quarter, ROUND(value_usd_billion, 2) capex_b
 FROM xbrl_quarterly WHERE metric = 'capex' ORDER BY ticker, quarter;
 ```
 
-## Known issues
+## Known limitations
 
-- **The number check is lenient for dollars.** In `numbers_in()`, a bare number in a dollar quote is tested as billions, millions and raw dollars at once, so a value with the wrong scale can still count as verified. Human review catches this.
-- **The Contracts & financing charts stack vertically.** `left = right = st.container()` puts both in one container; `st.columns(2)` would place them side by side.
-- **`--tickers` is pasted into SQL** in `cmd_extract`. This is harmless for a local tool, but a query parameter would be cleaner.
+- **Earnings calls are not covered.** Much capex guidance (Microsoft especially) is given only on calls, which are not SEC filings.
+- **10-Q and 10-K text is not read**, only their XBRL numbers. Some capacity, lease and commitment detail lives there.
+- **Classification is not checked automatically.** A real number put under the wrong metric or period passes the checks. Human review (`evaluate.py`) measures this, and `corrections.csv` removes known cases.
+- **Definitions differ by company.** "Contracted MW" may be gross or critical IT load, and hyperscaler backlog is company-wide RPO.

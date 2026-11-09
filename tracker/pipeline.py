@@ -5,6 +5,7 @@
     python -m tracker.pipeline filings            list 8-K/6-K filings and download exhibits
     python -m tracker.pipeline extract            run LLM extraction on new documents
     python -m tracker.pipeline run                all of the above, in order
+    python -m tracker.pipeline regrade            re-run the source checks on stored facts (no API calls)
     python -m tracker.pipeline status             row counts and extraction coverage
     python -m tracker.pipeline review-sheet       sample documents for human review
     python -m tracker.pipeline import-reviews F   load a filled review sheet
@@ -146,6 +147,30 @@ def cmd_extract(store: Store, args) -> None:
     log(f"Done: {total} facts")
 
 
+def cmd_regrade(store: Store, args) -> None:
+    """Re-run the source checks on every stored fact against its document text. No API calls."""
+    facts = store.table("facts")
+    if facts.empty:
+        log("No facts to regrade.")
+        return
+    texts = store.df("SELECT doc_id, text FROM documents WHERE doc_id IN (SELECT DISTINCT doc_id FROM facts)")
+    text_by_doc = dict(zip(texts["doc_id"], texts["text"]))
+    before = facts["status"].value_counts().to_dict()
+    rows = []
+    for f in facts.to_dict("records"):
+        source = text_by_doc.get(f["doc_id"])
+        if source is None:
+            rows.append(f)
+            continue
+        g = extract.ground({k: (None if v != v else v) if isinstance(v, float) else v for k, v in f.items()}, source)
+        rows.append({**f, "quote_match": g["quote_match"], "value_in_quote": g["value_in_quote"], "status": g["status"]})
+    out = pd.DataFrame(rows)
+    store.upsert("facts", out)
+    after = out["status"].value_counts().to_dict()
+    changed = int((out["status"].values != facts["status"].values).sum())
+    log(f"Regraded {len(out):,} facts; {changed:,} changed status. Before {before}, after {after}")
+
+
 def cmd_status(store: Store, args) -> None:
     for t in ("companies", "filings", "documents", "xbrl_quarterly", "facts", "reviews", "misses"):
         log(f"{t:15s} {store.df(f'SELECT COUNT(*) n FROM {t}')['n'][0]:>7,}")
@@ -163,7 +188,7 @@ def cmd_status(store: Store, args) -> None:
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="python -m tracker.pipeline", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["companies", "xbrl", "filings", "extract", "run", "status", "review-sheet",
+    p.add_argument("command", choices=["companies", "xbrl", "filings", "extract", "run", "regrade", "status", "review-sheet",
                                        "import-reviews", "eval", "publish", "export-csv", "demo"])
     p.add_argument("path", nargs="?", help="review sheet path for import-reviews")
     p.add_argument("--tickers", help="comma-separated subset, e.g. MSFT,CRWV")
@@ -197,6 +222,8 @@ def main(argv: list[str] | None = None) -> None:
                 log("LLM extraction"); cmd_extract(store, args)
         elif args.command == "extract":
             cmd_extract(store, args)
+        elif args.command == "regrade":
+            cmd_regrade(store, args)
         elif args.command == "status":
             cmd_status(store, args)
         elif args.command == "review-sheet":

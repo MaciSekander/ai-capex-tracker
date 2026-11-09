@@ -12,6 +12,8 @@ CACHE_DIR = DATA_DIR / "cache"
 DB_PATH = DATA_DIR / "tracker.duckdb"
 # Slim copy of the database (no document text) committed to git for the hosted dashboard.
 PUBLISHED_DB_PATH = ROOT / "app_data" / "tracker.duckdb"
+# Manual corrections applied by the dashboard: one row per fact to exclude, with the reason. Committed.
+CORRECTIONS_PATH = ROOT / "app_data" / "corrections.csv"
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> None:
