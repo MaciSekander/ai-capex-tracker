@@ -118,7 +118,7 @@ def load_corrections() -> pd.DataFrame:
 
 
 corrections = load_corrections() if not is_demo else pd.DataFrame(columns=["fact_id", "action", "reason", "date"])
-facts_all = A.apply_corrections(data["facts"], corrections).copy()
+facts_all = A.drop_periodic_deals(A.apply_corrections(data["facts"], corrections)).copy()
 facts_all["filing_date"] = pd.to_datetime(facts_all["filing_date"])
 filings = data["filings"].copy()
 filings["filing_date"] = pd.to_datetime(filings["filing_date"])
@@ -219,7 +219,6 @@ sb.markdown(
     "- Every extracted number links to the SEC filing it came from.\n"
     "- **Methodology** explains how each number is produced and checked."
 )
-sb.caption(f"Database: `{Path(path).parent.name}/{Path(path).name}`")
 
 # Filtered views
 facts = facts_all[facts_all["ticker"].isin(sel_tickers) & facts_all["status"].isin(allowed_status)
@@ -254,7 +253,8 @@ others = [t for t in sel_tickers if t not in hyp]
 st.title("AI Infrastructure Capex Tracker")
 st.markdown(
     "<div class='subtle'>What hyperscalers, neoclouds and AI infrastructure companies have disclosed to the SEC "
-    "about capital spending, capex guidance, power capacity, GPUs, backlog, customer contracts and financings.</div>",
+    "about capital spending, capex guidance, data-center leases, power capacity, GPUs, backlog, customer contracts "
+    "and financings.</div>",
     unsafe_allow_html=True,
 )
 last_run = pd.to_datetime(data["documents"]["extracted_at"]).max() if not data["documents"].empty else None
@@ -450,6 +450,35 @@ with tabs[1]:
             source_note("SEC XBRL. The dashed line is 100%: above it, capex exceeds the cash the business generates. "
                         "Quarters with negative trailing operating cash flow are omitted.")
 
+    st.subheader("Signed leases not yet commenced")
+    st.markdown(
+        "<div class='subtle'>Leases a company has signed as tenant, mostly data centers still under construction, "
+        "whose terms have not started yet. The amount is the total future lease payments. It shows capacity already "
+        "committed that is not yet in capex or on the balance sheet.</div>", unsafe_allow_html=True)
+    lser = A.lease_series(disc) if not disc.empty else pd.DataFrame()
+    if lser.empty:
+        st.info("No lease commitments for the current selection.")
+    else:
+        lc1, lc2 = st.columns([3, 2], gap="large")
+        with lc1:
+            chart(alt.Chart(lser).mark_line(point=True, strokeWidth=2).encode(
+                x=alt.X("as_of:T", title="As of"),
+                y=alt.Y("value:Q", title="$B"),
+                color=alt.Color("name:N", scale=company_colors(lser), title=None, legend=alt.Legend(orient="bottom", columns=5)),
+                tooltip=[alt.Tooltip("name:N", title="Company"), alt.Tooltip("display_value:N", title="Value"),
+                         alt.Tooltip("period:N", title="As of"), alt.Tooltip("first_stated:T", title="Stated"),
+                         alt.Tooltip("quote:N", title="Quote")]), 320)
+        with lc2:
+            ll = lser.sort_values("as_of").groupby("ticker").tail(1).sort_values("value", ascending=False)
+            lt = pd.DataFrame({"Company": ll["name"], "Latest": ll["display_value"],
+                               "As of": ll["as_of"].dt.strftime("%b %d, %Y"), "Source": ll["url"]})
+            table(lt, Source=LINK)
+            download(lt, "leases_not_commenced")
+        source_note("10-Q and 10-K lease notes, extracted by Claude and checked against the filing text. Only totals "
+                    "stated as of a date are plotted (not individual leases signed after it). Where a filing gives "
+                    "operating and finance leases separately (Microsoft before 2025, Meta 2023), the larger is shown. "
+                    "Company wording differs, so check the quote.")
+
 # ---------------------------------------------------------------------------
 # Guidance
 # ---------------------------------------------------------------------------
@@ -561,7 +590,7 @@ with tabs[3]:
         with st.expander("Table and download"):
             table(snap_out)
             download(snap_out, "power_snapshot")
-        source_note("Press releases and investor updates (8-K / 6-K), extracted by Claude and checked against the "
+        source_note("Press releases, investor updates (8-K / 6-K) and 10-Q / 10-K reports, extracted by Claude and checked against the "
                     "filing text. Site-level figures are excluded; where a filing gives a total and its parts, the "
                     "largest company-level figure is used. Definitions vary by company (gross vs critical IT MW).")
 
@@ -668,7 +697,7 @@ with tabs[4]:
         })
         table(out, height=460, url=LINK, Quote=st.column_config.TextColumn(width="large"))
         download(out.rename(columns={"url": "Source"}), "deals")
-        source_note("8-K and 6-K filings (item 1.01 material agreements, 2.03 debt, press releases), extracted by Claude "
+        source_note("Deal announcements and press releases (8-K / 6-K), extracted by Claude "
                     "and checked against the filing text. Repeated mentions of the same deal are shown once, dated "
                     "to the first filing that stated it.")
 
@@ -686,7 +715,7 @@ with tabs[5]:
     summ = A.capex_summary(cqt)
     dt = disc[disc["ticker"] == t] if not disc.empty else pd.DataFrame()
     ght = gh[gh["ticker"] == t] if not gh.empty else gh
-    lvt = A.latest_values(dt, list(POWER) + ["gpus_deployed", "backlog_usd"]) if not dt.empty else pd.DataFrame()
+    lvt = A.latest_values(dt, list(POWER) + ["gpus_deployed", "backlog_usd", "lease_not_commenced"]) if not dt.empty else pd.DataFrame()
 
     def latest_of(metric):
         r = lvt[lvt["metric"] == metric] if not lvt.empty else lvt
@@ -710,9 +739,10 @@ with tabs[5]:
         k[2].metric("Capex guidance", "—", "none in press releases", delta_color="off")
     v, d = latest_of("backlog_usd")
     k[3].metric("Revenue backlog", v, d, delta_color="off")
-    k = st.columns(4)
+    k = st.columns(5)
     for col, metric, label in ((k[0], "power_active_mw", "Active power"), (k[1], "power_contracted_mw", "Contracted power"),
-                               (k[2], "power_pipeline_mw", "Power pipeline"), (k[3], "gpus_deployed", "GPUs deployed")):
+                               (k[2], "power_pipeline_mw", "Power pipeline"), (k[3], "gpus_deployed", "GPUs deployed"),
+                               (k[4], "lease_not_commenced", "Leases not yet commenced")):
         v, d = latest_of(metric)
         col.metric(label, v, d, delta_color="off")
 
@@ -739,7 +769,7 @@ with tabs[5]:
     with right:
         st.markdown("**Recent filings**")
         ft = filings[filings["ticker"] == t].sort_values("filing_date", ascending=False).head(12)
-        table(pd.DataFrame({"Filed": ft["filing_date"].dt.date, "Form": ft["form"], "Items": ft["items"],
+        table(pd.DataFrame({"Filed": ft["filing_date"].dt.date, "Form": ft["form"],
                             "url": ft["url"]}), height=300, url=st.column_config.LinkColumn("Filing", display_text="Open"))
 
     st.markdown("**Latest disclosure for each metric**")
@@ -755,9 +785,6 @@ with tabs[5]:
                             "url": latest["url"]}),
               url=LINK, Quote=st.column_config.TextColumn(width="large"),
               Mentions=st.column_config.NumberColumn(help="Number of documents that state this number"))
-        if not cqt.empty:
-            st.caption("Reported capex is taken from SEC XBRL above, so press-release capex figures are left out of "
-                       "this table (they remain under All disclosures).")
         with st.expander(f"All {len(dt):,} disclosures for {who}"):
             all_t = dt.sort_values("first_stated", ascending=False)
             out = pd.DataFrame({"Stated": all_t["first_stated"].dt.date, "Metric": all_t["metric_label"],
@@ -797,11 +824,9 @@ with tabs[6]:
             "Stated": ex["first_stated"].dt.date, "Company": ex["name"], "Metric": ex["metric_label"],
             "Value": ex["display_value"], "Period / detail": ex["period"].fillna(""),
             "Counterparty": ex["counterparty"].fillna(""), "Mentions": ex["mentions"], "Check": ex["status"],
-            "Confidence": ex["confidence"], "Quote": ex["quote"], "url": ex["url"],
+            "Quote": ex["quote"], "url": ex["url"],
         })
-        table(out, height=560, url=LINK, Quote=st.column_config.TextColumn(width="large"),
-              Confidence=st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f",
-                                                         help="The model's own confidence, 0 to 1"))
+        table(out, height=560, url=LINK, Quote=st.column_config.TextColumn(width="large"))
         download(out.rename(columns={"url": "Source"}).assign(fact_id=ex["fact_id"].values), "disclosures")
 
 # ---------------------------------------------------------------------------
@@ -814,15 +839,16 @@ with tabs[7]:
     with a:
         st.markdown(
             """
-**1. Collect.** Every 8-K and 6-K filed since January 2024 by the tracked companies is downloaded from
-SEC EDGAR, along with its press-release exhibits. 8-Ks are limited to items that carry results, material
-agreements, debt and announcements (1.01, 2.02, 2.03, 7.01, 8.01).
+**1. Collect.** Every relevant filing since January 2024 by the tracked companies is downloaded from
+SEC EDGAR: earnings releases, deal announcements and financings (8-K and 6-K), and quarterly and annual
+reports (10-Q, 10-K and 20-F) for lease commitments, capacity and backlog. Contracts and financings are taken
+from announcements only, because quarterly reports restate older deals.
 
 **2. Quarterly capex (no AI involved).** Capital expenditures and operating cash flow come from the
 SEC's XBRL financial data, the tagged numbers in each 10-Q and 10-K. Year-to-date figures are differenced
 into single quarters. Nebius files annual XBRL only, so its quarterly capex comes from its press releases.
 
-**3. Extraction.** Paragraphs that mention capex, power, GPUs, backlog, contracts or financing are sent to
+**3. Extraction.** Paragraphs that mention capex, power, GPUs, backlog, leases, contracts or financing are sent to
 Claude (Anthropic), which records each fact in a fixed format and must copy the sentence it came from,
 word for word.
 
@@ -857,11 +883,8 @@ from the company's wording.
             """
 - **Earnings calls are not covered.** Much capex guidance (Microsoft especially) is given only on calls,
   which are not SEC filings.
-- **10-Q and 10-K text is not yet read**, only their XBRL numbers. Some capacity and lease detail lives there.
 - **Definitions differ by company.** "Contracted MW" may be gross or critical IT load; backlog for
   hyperscalers is company-wide RPO, not AI-only.
-- **The checks prove a number was stated, not that it was classified correctly.** A real number assigned
-  to the wrong metric or period still passes. Human review (below) measures this.
 - **Filing lag.** Companies report quarterly; the latest quarter appears 3 to 6 weeks after it ends.
             """
         )
@@ -870,25 +893,20 @@ from the company's wording.
     s = scores(facts_all, data["reviews"], data["misses"])
     s["metric"] = s["metric"].map(lambda m: METRIC_LABELS.get(m, "All metrics"))
     allrow = s[s["metric"] == "All metrics"].iloc[0]
-    q = st.columns(4)
+    reviewed = allrow["precision"] == allrow["precision"]
+    q = st.columns(4 if reviewed else 2)
     q[0].metric("Facts extracted (all mentions)", f"{int(allrow['facts']):,}")
     q[1].metric("Passed both checks", pct(allrow["verified"], False))
-    q[2].metric("Precision (human-reviewed)", pct(allrow["precision"], False) if allrow["precision"] == allrow["precision"] else "—",
-                help="Share of reviewed facts a person marked correct. '—' until the review workflow has been run "
-                     "(see README, Measure accuracy).")
-    q[3].metric("Recall (human-reviewed)", pct(allrow["recall"], False) if allrow["recall"] == allrow["recall"] else "—",
-                help="Share of the facts in reviewed documents that the model found. '—' until reviewed.")
-    show = s.copy()
-    for col in ("verified", "quote_found", "precision", "recall", "f1"):
-        show[col] = show[col].map(lambda v: "—" if v != v else f"{v:.0%}")
-    table(show.rename(columns={"metric": "Metric", "facts": "Facts", "verified": "Verified", "quote_found": "Quote found",
-                               "reviewed": "Reviewed", "missed": "Missed", "precision": "Precision", "recall": "Recall",
-                               "f1": "F1"}))
+    if reviewed:
+        q[2].metric("Precision (human-reviewed)", pct(allrow["precision"], False),
+                    help="Share of reviewed facts a person marked correct.")
+        q[3].metric("Recall (human-reviewed)", pct(allrow["recall"], False) if allrow["recall"] == allrow["recall"] else "—",
+                    help="Share of the facts in reviewed documents that the model found.")
     stat = facts_all.groupby(["metric", "status"], as_index=False).size()
     stat["metric"] = stat["metric"].map(lambda m: METRIC_LABELS.get(m, m))
     c = alt.Chart(stat).mark_bar().encode(
         y=alt.Y("metric:N", title=None, axis=alt.Axis(labelOverlap=False, labelLimit=200)),
-        x=alt.X("size:Q", title="Share of facts", stack="normalize", axis=alt.Axis(format="%")),
+        x=alt.X("size:Q", title="Share of facts", stack="normalize", axis=alt.Axis(format="%", tickCount=5)),
         color=alt.Color("status:N", scale=STATUS_COLORS, title=None, legend=alt.Legend(orient="bottom")),
         tooltip=[alt.Tooltip("metric:N", title="Metric"), alt.Tooltip("status:N", title="Check"),
                  alt.Tooltip("size:Q", title="Facts")])
@@ -903,19 +921,13 @@ from the company's wording.
         on="ticker", how="left").merge(xq_cap.reset_index(), on="ticker", how="left").merge(
         A.disclosures(facts_all[facts_all["status"] == "verified"]).groupby("ticker").size().rename("disclosures").reset_index(),
         on="ticker", how="left")
-    table(pd.DataFrame({"Company": cov["name"], "Type": cov["group"], "Documents": cov["documents"],
-                        "Extracted": cov["extracted"], "Verified disclosures": cov["disclosures"],
-                        "Capex quarters": cov["quarters"], "Latest capex quarter": cov["latest"],
-                        "Capex source": cov["source"]}),
-          Extracted=st.column_config.NumberColumn(help="Documents with relevant text sent for extraction. The rest "
-                                                       "(cover pages, unrelated exhibits) had no relevant text."))
-    st.subheader("Manual corrections")
-    st.markdown("<div class='subtle'>Facts that passed the automatic checks but were judged misclassified on review. "
-                "They are excluded everywhere in the dashboard. The list lives in <code>app_data/corrections.csv</code>."
-                "</div>", unsafe_allow_html=True)
-    if corrections.empty:
-        st.caption("No manual corrections.")
-    else:
+    table(pd.DataFrame({"Company": cov["name"], "Type": cov["group"], "Filings read": cov["documents"],
+                        "Verified disclosures": cov["disclosures"], "Capex quarters": cov["quarters"],
+                        "Latest capex quarter": cov["latest"], "Capex source": cov["source"]}))
+    if not corrections.empty:
+        st.subheader("Excluded figures")
+        st.markdown("<div class='subtle'>Figures removed on review because they were filed under the wrong metric. "
+                    "They are left out everywhere in the dashboard.</div>", unsafe_allow_html=True)
         fx = data["facts"].set_index("fact_id")
         cor = corrections.assign(
             company=corrections["fact_id"].map(fx["ticker"]).map(NAME),
@@ -923,9 +935,6 @@ from the company's wording.
             value=[fmt_value(fx.at[i, "value"], fx.at[i, "unit"]) if i in fx.index else "—" for i in corrections["fact_id"]],
             url=corrections["fact_id"].map(fx["url"]))
         table(pd.DataFrame({"Company": cor["company"], "Metric": cor["metric"], "Value": cor["value"],
-                            "Action": cor["action"], "Reason": cor["reason"], "Date": cor["date"], "url": cor["url"]}),
+                            "Reason": cor["reason"], "Date": cor["date"], "url": cor["url"]}),
               url=LINK, Reason=st.column_config.TextColumn(width="large"))
 
-    model = docs["model"].dropna().iloc[-1] if docs["model"].notna().any() else "—"
-    st.caption(f"Extraction model: {model}. Database: {Path(path).name}. "
-               "To refresh, run the pipeline (see README): filings → extract → publish.")

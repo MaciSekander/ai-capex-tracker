@@ -163,3 +163,36 @@ def test_dashboard_renders_every_tab_on_demo_data(tmp_path, monkeypatch):
     at.toggle(key="ex_raw").set_value(True).run()
     at.text_input(key="ex_query").input("billion").run()
     assert not at.exception, [e.value for e in at.exception]
+
+
+def test_periodic_reports_use_primary_document_and_narrow_filter():
+    from tracker.edgar import select_documents
+
+    docs = [{"document": "msft-10q.htm", "type": "10-Q"}, {"document": "ex31.htm", "type": "EX-31.1"},
+            {"document": "ex99.htm", "type": "EX-99.1"}]
+    assert [d["document"] for d in select_documents(docs, "10-Q", "msft-10q.htm")] == ["msft-10q.htm"]
+    text = ("Risk factors\n\nOur data center financing and credit facility may be affected.\n\nUnrelated text.\n\n"
+            "Other text.\n\nAs of June 30, 2026, we had additional leases, primarily for datacenters, that had not "
+            "yet commenced of $329.1 billion.")
+    periodic = " ".join(extract.relevant_chunks(text, form="10-Q"))
+    assert "not yet commenced" in periodic and "credit facility" not in periodic
+    assert "credit facility" in " ".join(extract.relevant_chunks(text, form="8-K"))
+
+
+def test_deals_come_from_announcements_only():
+    facts = pd.DataFrame([fact(metric="financing", form="8-K"), fact(metric="financing", form="10-Q", value=2.0),
+                          fact(metric="lease_not_commenced", form="10-Q", value=3.0)])
+    assert A.drop_periodic_deals(facts)["value"].tolist() == [100.0, 3.0]
+
+
+def test_lease_series_keeps_dated_totals():
+    disc = A.disclosures(pd.DataFrame([
+        fact(metric="lease_not_commenced", unit="USD_billion", value=85.1, period="as of December 31, 2023", doc_id="a"),
+        fact(metric="lease_not_commenced", unit="USD_billion", value=7.5, period="as of December 31, 2023", doc_id="a"),
+        fact(metric="lease_not_commenced", unit="USD_billion", value=9.9, period="between 2027 and 2047", doc_id="b"),
+        fact(metric="lease_not_commenced", unit="USD_billion", value=68.0, period="July 2026 additional leases", doc_id="b"),
+        fact(metric="lease_not_commenced", unit="USD_billion", value=92.7, period="as of June 30, 2025", doc_id="c"),
+    ]))
+    s = A.lease_series(disc)
+    assert s["value"].tolist() == [85.1, 92.7]
+    assert s["as_of"].tolist() == [pd.Timestamp("2023-12-31"), pd.Timestamp("2025-06-30")]

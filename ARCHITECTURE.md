@@ -19,7 +19,7 @@ SEC EDGAR ──► edgar.py ──► filings + document text ─┐
 There are two kinds of data:
 
 - **Quarterly capex and operating cash flow** come from the SEC's structured XBRL data. These numbers are exact, and no model is involved.
-- **Everything else** (guidance, power, GPUs, backlog, contracts, financings) is extracted from 8-K and 6-K press releases by Claude, then checked against the source text.
+- **Everything else** (guidance, power, GPUs, backlog, contracts, financings) is extracted from 8-K and 6-K press releases, and from 10-Q, 10-K and 20-F report text, by Claude, then checked against the source text. Signed leases not yet commenced come from the periodic reports' lease notes.
 
 ## Files
 
@@ -70,8 +70,8 @@ Follows the SEC's rules for automated access.
   - stays at 8 requests per second, under the SEC's limit of 10;
   - caches every response on disk in `data/cache/`. Filing documents never change, so they are cached permanently. Filing lists and XBRL data refresh after 12 hours;
   - retries 429 and 5xx responses with increasing waits.
-- **`filings()`** lists 8-K and 6-K filings since the start date. It drops 8-Ks whose items are all irrelevant and keeps items 1.01 (material agreements), 2.02 (results), 2.03 (debt), 7.01 and 8.01.
-- **`parse_index()` and `select_documents()`** read each filing's index page and keep the press-release exhibits (EX-99.x) and the primary document.
+- **`filings()`** lists 8-K, 6-K, 10-Q, 10-K and 20-F filings since the start date (`config.FILING_FORMS`). It drops 8-Ks whose items are all irrelevant and keeps items 1.01 (material agreements), 2.02 (results), 2.03 (debt), 7.01 and 8.01.
+- **`parse_index()` and `select_documents()`** read each filing's index page and keep the press-release exhibits (EX-99.x) and the primary document. For periodic reports (`config.PERIODIC_FORMS`) only the primary document is kept, and `extract.relevant_chunks(text, form=...)` uses the narrower `PERIODIC_KEYWORDS` filter (lease commitments not yet commenced, capex statements, MW, GPUs, backlog), because these reports mention data centers and financing on most pages.
 - **`html_to_text()`** turns SEC HTML into plain text. Table rows become `cell | cell | cell` lines so numbers keep their labels.
 
 ### `tracker/xbrl.py`: quarterly capex and cash flow
@@ -109,7 +109,7 @@ Current models (including `claude-sonnet-5-5`) reject a forced `tool_choice`. Th
 | Table | Contents |
 |---|---|
 | `companies` | Ticker, name, group, SEC CIK |
-| `filings` | One row per 8-K or 6-K |
+| `filings` | One row per 8-K, 6-K, 10-Q, 10-K or 20-F |
 | `documents` | Each exhibit's full text, plus when and with which model it was extracted |
 | `xbrl_quarterly` | Quarterly capex and operating cash flow, in USD billions |
 | `facts` | Extracted facts with quote, check status and confidence |
@@ -156,6 +156,7 @@ Pure pandas functions, tested in `tests/test_analytics.py`.
 - **`disclosures()`** merges repeated facts. Companies restate the same number in the release, the deck and later releases, so each distinct (company, metric, value, period, counterparty, site) is kept once, with `first_stated`, `last_stated` and `mentions`. Contracts and financings with the same company and amount stated within 180 days are treated as one deal, because deals are restated in different words.
 - **`period_label()`** normalizes periods ("FY2026", "fiscal 2026", "2026" → "2026"; "FY27 Q1" → "Q1 2027"). Open-ended periods ("over the next several years") return `None`.
 - **`guidance_history()`** orders each company's guidance for a period and labels every statement `initial`, `raised`, `lowered` or `maintained` from the numbers. A narrowed range counts as raised if its midpoint or an end moved up. The company's own wording is kept separately.
+- **`drop_periodic_deals()`** removes contracts and financings extracted from 10-Q, 10-K and 20-F reports, which restate older deals each quarter; deals come from 8-K and 6-K announcements only.
 - **`capex_quarterly()`** returns XBRL quarters plus press-release quarters for companies with no quarterly XBRL, with a `source` column.
 - **`capex_summary()` / `ttm_total()`** compute latest quarter, quarter-on-quarter, year-over-year and last four quarters. Four-quarter totals require four consecutive quarters.
 - **`latest_values()` / `metric_series()`** pick company-level figures (no site named; the largest value when a filing gives a total and its parts).
@@ -229,6 +230,6 @@ FROM xbrl_quarterly WHERE metric = 'capex' ORDER BY ticker, quarter;
 ## Known limitations
 
 - **Earnings calls are not covered.** Much capex guidance (Microsoft especially) is given only on calls, which are not SEC filings.
-- **10-Q and 10-K text is not read**, only their XBRL numbers. Some capacity, lease and commitment detail lives there.
+- **10-Q and 10-K text is read selectively.** Only passages matching `PERIODIC_KEYWORDS` are extracted; other commitments (purchase obligations, guarantees) are not captured.
 - **Classification is not checked automatically.** A real number put under the wrong metric or period passes the checks. Human review (`evaluate.py`) measures this, and `corrections.csv` removes known cases.
 - **Definitions differ by company.** "Contracted MW" may be gross or critical IT load, and hyperscaler backlog is company-wide RPO.

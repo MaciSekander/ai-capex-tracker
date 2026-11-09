@@ -28,6 +28,14 @@ KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Periodic reports (10-Q, 10-K, 20-F) are long and say "data center", "financing" and "contracted" on most
+# pages, so they get a narrower filter: the notes and MD&A passages that state the tracked numbers.
+PERIODIC_KEYWORDS = re.compile(
+    r"not yet commenced|(?:have|had) not commenced|additional lease commitments|expected to commence|capital expenditures? (?:were|was|of|totaled|increased|decreased)|purchases of property"
+    r"|megawatt|gigawatt|\bMW\b|\bGW\b|\bGPUs?\b|remaining performance obligation|backlog",
+    re.IGNORECASE,
+)
+
 MAX_CHUNK_CHARS = 18_000
 
 SYSTEM_PROMPT = """You extract structured facts about AI infrastructure investment from SEC filings and press releases.
@@ -45,6 +53,8 @@ Rules:
 - change: for guidance, "raised", "lowered", "reaffirmed" or "new" only if the text says so; otherwise "not_stated".
 - quote: copy the exact sentence or table row that states the number, verbatim, at most 300 characters. Do not paraphrase.
 - confidence: 0 to 1, your confidence the fact is correctly read.
+- customer_contract is revenue the filer will earn from a customer. Leases the filer signed as tenant are never customer_contract; if they have not yet commenced, record them as lease_not_commenced.
+- In 10-Q, 10-K and 20-F reports, record capex_reported only for the filer's total for the period, not segments.
 - If nothing qualifies, return an empty list. Never guess.
 """
 
@@ -96,12 +106,13 @@ TOOL = {
 # ---------------------------------------------------------------------------
 
 
-def relevant_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
-    """Paragraphs that match KEYWORDS, plus one paragraph either side, packed into chunks."""
+def relevant_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS, form: str | None = None) -> list[str]:
+    """Paragraphs that match the keywords for this form, plus one paragraph either side, packed into chunks."""
+    pattern = PERIODIC_KEYWORDS if form in config.PERIODIC_FORMS else KEYWORDS
     paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     keep = set()
     for i, p in enumerate(paras):
-        if KEYWORDS.search(p):
+        if pattern.search(p):
             keep.update({i - 1, i, i + 1})
     selected = [paras[i] for i in sorted(keep) if 0 <= i < len(paras)]
     chunks, cur = [], ""
@@ -310,7 +321,7 @@ def fact_id(doc_id: str, f: dict) -> str:
 def extract_document(client: Any, meta: dict, text: str, model: str | None = None) -> list[dict]:
     """All grounded facts for one document."""
     facts, seen = [], set()
-    for chunk in relevant_chunks(text):
+    for chunk in relevant_chunks(text, form=meta.get("form")):
         for raw in call_model(client, build_prompt(meta, chunk), model):
             f = clean_fact(raw)
             if f is None:

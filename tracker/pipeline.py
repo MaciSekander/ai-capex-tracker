@@ -97,7 +97,7 @@ def cmd_filings(store: Store, client: EdgarClient, args) -> None:
                 if doc_id in have:
                     continue
                 text = client.document_text(d["url"])
-                relevant = sum(len(ch) for ch in extract.relevant_chunks(text))
+                relevant = sum(len(ch) for ch in extract.relevant_chunks(text, form=f["form"]))
                 rows.append({
                     "doc_id": doc_id, "accession": f["accession"], "ticker": c["ticker"], "document": d["document"],
                     "doc_type": d["type"], "description": d["description"], "url": d["url"], "text": text,

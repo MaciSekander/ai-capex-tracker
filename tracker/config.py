@@ -55,8 +55,10 @@ COMPANIES: list[Company] = [
     Company("GLXY", "Galaxy Digital", "AI infrastructure"),
 ]
 
-# Filings to scan. 8-K and 6-K carry earnings releases and deal announcements.
-FILING_FORMS = ("8-K", "6-K")
+# Filings to scan. 8-K and 6-K carry earnings releases and deal announcements; 10-Q, 10-K and 20-F
+# (periodic reports) carry lease commitments, capacity and backlog in their notes.
+FILING_FORMS = ("8-K", "6-K", "10-Q", "10-K", "20-F")
+PERIODIC_FORMS = ("10-Q", "10-K", "20-F")
 START_DATE = os.environ.get("TRACKER_START_DATE", "2024-01-01")
 
 # SEC requires a descriptive User-Agent with contact details for automated access.
@@ -108,6 +110,12 @@ METRICS: dict[str, dict] = {
         "label": "Customer contract",
         "unit": "USD_billion",
         "desc": "A specific new or expanded customer, lease or offtake contract: total value, counterparty, term.",
+    },
+    "lease_not_commenced": {
+        "label": "Leases not yet commenced",
+        "unit": "USD_billion",
+        "desc": "Leases the company has signed as tenant (mostly data centers still under construction) whose terms "
+                "have not yet commenced: total future lease payments as of a date. Not a customer contract.",
     },
     "financing": {
         "label": "Financing",

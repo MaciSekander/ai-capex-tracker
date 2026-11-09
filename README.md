@@ -3,10 +3,10 @@
 A dashboard of what hyperscalers, neoclouds and AI infrastructure companies disclose about the AI buildout: capital expenditures, capex guidance, power capacity, GPU counts, revenue backlog, customer contracts and financings.
 
 - **Quarterly capex and operating cash flow** come from SEC XBRL data, with year-to-date figures differenced into quarters.
-- **Everything else** is extracted from 8-K and 6-K filings (press releases and deal announcements) by Claude, into a fixed schema.
+- **Everything else** is extracted by Claude, into a fixed schema, from 8-K and 6-K filings (press releases and deal announcements) and from the text of 10-Q, 10-K and 20-F reports (lease commitments, capacity, backlog).
 - **Every extracted fact is checked.** It must carry a verbatim quote, and the pipeline confirms the quote appears in the filing and the number, with a matching unit, appears in the quote. Facts are marked verified, partial or unverified, and the dashboard shows only verified facts by default.
 - **Every number links to its source filing.** Repeated statements of the same number are shown once, dated to the first filing that stated it.
-- **Accuracy is measured.** A review workflow samples whole documents for a person to mark up, which gives precision and recall by metric. The Data quality tab shows both.
+- **Accuracy is measured.** A review workflow samples whole documents for a person to mark up, which gives precision and recall by metric. The Methodology tab shows both once a review has been run.
 
 For what each file does, how the checks work and how to browse the database, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -15,7 +15,7 @@ For what each file does, how the checks work and how to browse the database, see
 | Tab | Use it to |
 |---|---|
 | **Overview** | See headline capex, guidance revisions and every disclosure first stated in the last 7, 30 or 90 days |
-| **Capex** | Compare quarterly capex, the capex scorecard (quarter, year-over-year, last four quarters) and capex as a share of operating cash flow |
+| **Capex** | Compare quarterly capex, the capex scorecard (quarter, year-over-year, last four quarters), capex as a share of operating cash flow and signed data-center leases not yet commenced |
 | **Guidance** | Follow each company's capex guidance and whether it was raised, lowered or maintained |
 | **Power & capacity** | Compare active, contracted and pipeline MW, GPUs deployed and revenue backlog |
 | **Contracts & financing** | Review customer contracts and debt or equity financings, with counterparties and terms |
@@ -53,7 +53,7 @@ streamlit run streamlit_app.py
 ```bash
 python -m tracker.pipeline companies              # look up SEC IDs for each ticker
 python -m tracker.pipeline xbrl                   # quarterly capex and operating cash flow
-python -m tracker.pipeline filings                # 8-K/6-K filings since 2024 and their exhibits
+python -m tracker.pipeline filings                # 8-K/6-K filings and exhibits, 10-Q/10-K/20-F reports, since 2024
 python -m tracker.pipeline extract --dry-run      # how many documents and tokens, no API calls
 python -m tracker.pipeline extract --limit 10     # small first run; check the results
 python -m tracker.pipeline extract                # everything else
@@ -64,13 +64,13 @@ streamlit run streamlit_app.py                    # now shows real data
 - **First run time.** Downloads respect SEC's limit of 10 requests a second, so the first `filings` run takes a while. Everything is cached, and later runs only fetch what's new.
 - **Cost.** Run `--dry-run` to see the token count before spending anything. Extraction sends only the paragraphs that mention capex, power, GPUs, backlog, contracts or financing.
 - **Picking up new filings.** Rerun `filings` then `extract`; only new documents are processed. `--tickers MSFT,CRWV` limits any step to a few companies, and `--redo` re-extracts.
-- **Effort and cost.** Extraction runs `claude-sonnet-5-5` at low effort by default (`ANTHROPIC_EFFORT` in `.env`). A full run of about 1,000 documents costs roughly $10.
+- **Effort and cost.** Extraction runs `claude-sonnet-5-5` at low effort by default (`ANTHROPIC_EFFORT` in `.env`). A full run of about 1,000 press-release documents costs roughly $10; the 140 periodic reports since 2024 cost about $5 more.
 
 ## Weekly update
 
 ```bash
 python -m tracker.pipeline xbrl                   # new quarters
-python -m tracker.pipeline filings                # new 8-K / 6-K filings
+python -m tracker.pipeline filings                # new 8-K, 6-K, 10-Q, 10-K and 20-F filings
 python -m tracker.pipeline extract                # only new documents
 python -m tracker.pipeline publish                # refresh app_data/tracker.duckdb
 git add app_data && git commit -m "Update data" && git push

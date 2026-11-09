@@ -105,6 +105,15 @@ def build_demo(path: Path) -> Path:
                 f"{names[t]} {verb} capital expenditures of ${low} billion to ${high} billion for {period}.",
                 low=float(low), high=float(high), change=change)
 
+    for t in guidance:
+        for i in range(6):
+            filed = date(2025, 5, 1) + timedelta(days=91 * i)
+            as_of = (filed - timedelta(days=31)).isoformat()
+            amount = round(40 + 18 * i + 9 * list(guidance).index(t), 1)
+            add(t, filed, "lease_not_commenced", amount, "USD_billion", f"as of {as_of}",
+                f"As of quarter end, we had additional leases, primarily for data centers, that had not yet "
+                f"commenced of ${amount} billion.", as_of=as_of)
+
     neo = {"NEO1": (420, 2900, 160, 1400, 85_000, 310_000, 9, 62),
            "NEO2": (60, 900, 20, 310, 6_000, 72_000, 0.6, 14),
            "INF1": (120, 1500, 0, 380, 0, 0, 0.2, 9)}

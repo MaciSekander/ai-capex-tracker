@@ -181,7 +181,11 @@ def parse_index(html: str, cik: int, accession: str) -> list[dict]:
 
 
 def select_documents(docs: list[dict], form: str, primary: str) -> list[dict]:
-    """Press-release exhibits (EX-99.x) plus the primary document for 6-Ks and short 8-Ks."""
+    """Press-release exhibits (EX-99.x) plus the primary document. Periodic reports: the primary document only."""
+    from .config import PERIODIC_FORMS
+
+    if form in PERIODIC_FORMS:
+        return [d for d in docs if d["document"] == primary and d["document"].lower().endswith((".htm", ".html"))]
     keep = []
     for d in docs:
         name = d["document"].lower()

@@ -136,6 +136,20 @@ def apply_corrections(facts: pd.DataFrame, corrections: pd.DataFrame) -> pd.Data
     return facts[~facts["fact_id"].isin(drop)]
 
 
+PERIODIC_FORMS = ("10-Q", "10-K", "20-F")
+
+
+def drop_periodic_deals(facts: pd.DataFrame) -> pd.DataFrame:
+    """Contracts and financings come from 8-K / 6-K announcements only.
+
+    10-Q and 10-K notes restate older deals every quarter (and give year-to-date totals), which would
+    otherwise show up as new deals dated to the report.
+    """
+    if facts.empty or "form" not in facts:
+        return facts
+    return facts[~(facts["form"].isin(PERIODIC_FORMS) & facts["metric"].isin(DEAL_METRICS))]
+
+
 # ---------------------------------------------------------------------------
 # Capex guidance
 # ---------------------------------------------------------------------------
@@ -319,3 +333,19 @@ def metric_series(disc: pd.DataFrame, metric: str) -> pd.DataFrame:
         return d
     d = d[d["site"].isna() | (d["site"].astype(str).str.strip() == "")]
     return d.sort_values("value", ascending=False).drop_duplicates(["ticker", "first_stated"]).sort_values("first_stated")
+
+
+def lease_series(disc: pd.DataFrame) -> pd.DataFrame:
+    """Leases not yet commenced, as point-in-time totals by company and as-of date.
+
+    Keeps only figures whose period is a date ("as of June 30, 2026"); amounts for individual leases signed
+    after the balance sheet date ("subsequent to ...", "July 2026") are left out. Where several totals are
+    given for one date (operating and finance leases separately), the largest is kept.
+    """
+    d = disc[disc["metric"] == "lease_not_commenced"].copy()
+    if d.empty:
+        return d.assign(as_of=pd.Series(dtype="datetime64[ns]"))
+    text = d["period"].fillna("").str.replace(r"(?i)^\s*as of\s+", "", regex=True)
+    d["as_of"] = pd.to_datetime(text, format="mixed", errors="coerce")
+    d = d[d["as_of"].notna()]
+    return d.sort_values("value", ascending=False).drop_duplicates(["ticker", "as_of"]).sort_values("as_of")

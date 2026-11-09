@@ -1,2 +1,2 @@
 fact_id,action,reason,date
-d20e48670011cbc2,exclude,"Microsoft's own data-center leases not yet commenced (Microsoft is the tenant), not a customer contract",2026-11-08
+d20e48670011cbc2,exclude,"Leases Microsoft has signed as tenant (mainly data centers still under construction) whose terms have not yet commenced; a future lease commitment, not a customer contract",2026-11-08
