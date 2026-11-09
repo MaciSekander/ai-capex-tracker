@@ -15,6 +15,7 @@ For what each file does, how the checks work and how to browse the database, see
 | Tab | Use it to |
 |---|---|
 | **Overview** | See headline capex, guidance revisions and every disclosure first stated in the last 7, 30 or 90 days |
+| **Signals** | See where spending is heading: the lease pipeline (signed, started, implied new signings), projected lease starts, capex momentum and neocloud funding. Every figure is calculated from the other tabs, with its formula shown |
 | **Capex** | Compare quarterly capex, the capex scorecard (quarter, year-over-year, last four quarters), capex as a share of operating cash flow and signed data-center leases not yet commenced |
 | **Guidance** | Follow each company's capex guidance and whether it was raised, lowered or maintained |
 | **Power & capacity** | Compare active, contracted and pipeline MW, GPUs deployed and revenue backlog |

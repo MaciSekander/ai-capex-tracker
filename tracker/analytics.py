@@ -348,4 +348,133 @@ def lease_series(disc: pd.DataFrame) -> pd.DataFrame:
     text = d["period"].fillna("").str.replace(r"(?i)^\s*as of\s+", "", regex=True)
     d["as_of"] = pd.to_datetime(text, format="mixed", errors="coerce")
     d = d[d["as_of"].notna()]
+    # "operating and finance leases ... of $8.4 billion and $87.8 billion, respectively": the parts of one total.
+    parts = d["quote"].fillna("").str.contains("respectively", case=False)
+    if parts.any():
+        keys = ["ticker", "as_of", "quote"]
+        summed = d[parts].sort_values("value", ascending=False).groupby(keys, as_index=False).agg(
+            {**{c: "first" for c in d.columns if c not in keys + ["value"]}, "value": "sum"})
+        d = pd.concat([d[~parts], summed], ignore_index=True)
     return d.sort_values("value", ascending=False).drop_duplicates(["ticker", "as_of"]).sort_values("as_of")
+
+
+# ---------------------------------------------------------------------------
+# Lease pipeline: signed, started and projected
+# ---------------------------------------------------------------------------
+#
+# pool(t)    = leases signed but not yet commenced, total future payments (10-Q / 10-K text)
+# starts(t)  = leases that commenced in quarter t, present value (XBRL right-of-use assets obtained),
+#              converted to total payments with the company's ratio of lease payments due to lease liability
+# signed(t)  = pool(t) - pool(t-1) + starts(t)        (implied: companies do not report it)
+
+
+def _pivot(xq: pd.DataFrame, metrics) -> pd.DataFrame:
+    x = xq[xq["metric"].isin(metrics)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["ticker", "end", *metrics])
+    x["end"] = pd.to_datetime(x["end"]).astype("datetime64[ns]")
+    out = x.pivot_table(index=["ticker", "end"], columns="metric", values="value_usd_billion", aggfunc="last")
+    return out.reindex(columns=list(metrics)).reset_index()
+
+
+def lease_flows(xq: pd.DataFrame, disc: pd.DataFrame) -> pd.DataFrame:
+    """One row per company and quarter end with pool, starts and implied signings (USD billions)."""
+    cols = ["ticker", "end", "pool", "pool_prev", "starts_pv", "factor", "starts", "signed"]
+    pool = lease_series(disc)
+    if pool.empty:
+        return pd.DataFrame(columns=cols)
+    pool = pool[["ticker", "as_of", "value"]].rename(columns={"as_of": "end", "value": "pool"})
+    pool["end"] = pd.to_datetime(pool["end"]).astype("datetime64[ns]")
+
+    st = _pivot(xq, ["lease_starts_operating", "lease_starts_finance"])
+    st["starts_pv"] = st["lease_starts_operating"] + st["lease_starts_finance"].fillna(0)
+    bal = _pivot(xq, ["lease_payments_operating", "lease_payments_finance", "lease_liability_operating",
+                      "lease_liability_finance"])
+    bal["factor"] = ((bal["lease_payments_operating"] + bal["lease_payments_finance"].fillna(0))
+                     / (bal["lease_liability_operating"] + bal["lease_liability_finance"].fillna(0)))
+    bal = bal[bal["factor"].between(1.0, 3.0)]
+
+    rows = []
+    for t, g in pool.sort_values("end").groupby("ticker"):
+        g = g.copy()
+        g["pool_prev"] = g["pool"].shift()
+        gap = (g["end"] - g["end"].shift()).dt.days
+        g.loc[~gap.between(80, 100), "pool_prev"] = np.nan
+        s = st[st["ticker"] == t][["end", "starts_pv"]].dropna()
+        g = pd.merge_asof(g.sort_values("end"), s.sort_values("end"), on="end", direction="nearest",
+                          tolerance=pd.Timedelta(days=7))
+        b = bal[bal["ticker"] == t][["end", "factor"]].sort_values("end")
+        g = pd.merge_asof(g, b, on="end", direction="backward") if not b.empty else g.assign(factor=np.nan)
+        if not b.empty:
+            g["factor"] = g["factor"].fillna(b["factor"].iloc[0])
+        rows.append(g)
+    out = pd.concat(rows, ignore_index=True)
+    out["starts"] = out["starts_pv"] * out["factor"]
+    out["signed"] = out["pool"] - out["pool_prev"] + out["starts"]
+    return out[cols]
+
+
+LEASE_LAG_QUARTERS = 4  # leases signed now mostly start once construction finishes, about a year later
+
+
+def _pool_at(g: pd.DataFrame, when: pd.Timestamp, tol_days: int = 20) -> float:
+    d = (g["end"] - when).abs()
+    return float(g.loc[d.idxmin(), "pool"]) if len(g) and d.min() <= pd.Timedelta(days=tol_days) else np.nan
+
+
+def _interp_pool(pools: dict, when: pd.Timestamp) -> float:
+    """Backlog at ``when``: the disclosed figure (within 20 days), else linear between the nearest dates around it."""
+    for e, p_ in pools.items():
+        if abs((e - when).days) <= 20:
+            return p_
+    before = [(e, p_) for e, p_ in pools.items() if e < when]
+    after = [(e, p_) for e, p_ in pools.items() if e > when]
+    if before and after:
+        (e0, p0), (e1, p1) = max(before), min(after)
+        return p0 + (p1 - p0) * (when - e0).days / (e1 - e0).days
+    return (max(before) if before else min(after))[1]
+
+
+def lease_projection(flows: pd.DataFrame, quarters: int = 8, lag: int = LEASE_LAG_QUARTERS, lookback: int = 4):
+    """Project lease starts from the backlog of signed leases, all in total future payments ($B).
+
+    Leases start when the building is finished, so starts in a quarter are modeled as a share ``rate``
+    of the backlog ``lag`` quarters earlier:  starts(t) = rate x pool(t - lag).  ``rate`` is fitted on
+    the company's last ``lookback`` quarters with lease starts. The next ``lag`` quarters therefore
+    follow from backlog already disclosed; later quarters need the backlog itself projected:
+    pool(t) = pool(t-1) + signed - starts(t), with ``signed`` either the trailing average of implied
+    signings ("Signings continue") or zero ("No new signings").
+
+    Returns (projection rows, per-company assumptions).
+    """
+    proj, params = [], []
+    for t, g in flows.sort_values("end").groupby("ticker"):
+        g = g.reset_index(drop=True)
+        hist = g.dropna(subset=["starts"])
+        hist = hist[hist["end"] >= g["end"].max() - pd.Timedelta(days=550)].tail(lookback)
+        lagged = [_pool_at(g, e - pd.offsets.MonthEnd(3 * lag)) for e in hist["end"]]
+        pairs = [(s_, p_) for s_, p_ in zip(hist["starts"], lagged) if p_ == p_]
+        if len(pairs) < 2 or sum(p_ for _, p_ in pairs) <= 0:
+            continue
+        rate = sum(s_ for s_, _ in pairs) / sum(p_ for _, p_ in pairs)
+        signed_recent = g.dropna(subset=["signed"]).tail(lookback)["signed"]
+        signed = max(float(signed_recent.mean()), 0.0) if len(signed_recent) else 0.0
+        factor = float(g["factor"].dropna().iloc[-1]) if g["factor"].notna().any() else np.nan
+        last = g.iloc[-1]
+        starts_4q = float(g.dropna(subset=["starts"]).tail(4)["starts"].sum())
+        params.append({"ticker": t, "rate": rate, "signed_avg": signed, "factor": factor, "pool": float(last["pool"]),
+                       "as_of": last["end"], "quarters_used": len(pairs), "starts_4q": starts_4q,
+                       "years_of_backlog": float(last["pool"]) / starts_4q if starts_4q > 0 else np.nan})
+        for case, add in (("Signings continue", signed), ("No new signings", 0.0)):
+            pools = {e: p_ for e, p_ in zip(g["end"], g["pool"])}
+            pool, end = float(last["pool"]), last["end"]
+            for k in range(1, quarters + 1):
+                end = end + pd.offsets.MonthEnd(3)
+                src = end - pd.offsets.MonthEnd(3 * lag)
+                base = _interp_pool(pools, src)
+                starts = rate * base
+                pool = max(pool - starts + add, 0.0)
+                pools[end] = pool
+                proj.append({"ticker": t, "end": end, "case": case, "starts": starts, "pool": pool,
+                             "from_disclosed_backlog": k <= lag})
+    return pd.DataFrame(proj), pd.DataFrame(params)

@@ -28,6 +28,21 @@ CONCEPTS = {
     ],
 }
 
+# Leases that commenced in the period: right-of-use assets recognized for new lease liabilities (present value).
+LEASE_FLOW_CONCEPTS = {
+    "lease_starts_operating": [("us-gaap", "RightOfUseAssetObtainedInExchangeForOperatingLeaseLiability")],
+    "lease_starts_finance": [("us-gaap", "RightOfUseAssetObtainedInExchangeForFinanceLeaseLiability")],
+}
+CONCEPTS.update(LEASE_FLOW_CONCEPTS)
+
+# Balance-sheet lease totals at each period end, used to convert present values to total payments.
+INSTANT_CONCEPTS = {
+    "lease_liability_operating": ("us-gaap", "OperatingLeaseLiability"),
+    "lease_liability_finance": ("us-gaap", "FinanceLeaseLiability"),
+    "lease_payments_operating": ("us-gaap", "LesseeOperatingLeaseLiabilityPaymentsDue"),
+    "lease_payments_finance": ("us-gaap", "FinanceLeaseLiabilityPaymentsDue"),
+}
+
 # Used only when a company reports none of the concepts above (Hut 8 tags capex this way).
 FALLBACK_CONCEPTS = {
     "capex": [("us-gaap", "PaymentsToAcquireMachineryAndEquipment")],
@@ -56,6 +71,32 @@ def _facts_for(facts: dict, taxonomy: str, concept: str) -> pd.DataFrame:
     df["end"] = pd.to_datetime(df["end"]).dt.date
     # Latest filing wins for restated periods.
     return df.sort_values("filed").drop_duplicates(["start", "end"], keep="last").reset_index(drop=True)
+
+
+def _instants_for(facts: dict, taxonomy: str, concept: str) -> pd.DataFrame:
+    node = facts.get("facts", {}).get(taxonomy, {}).get(concept)
+    if not node:
+        return pd.DataFrame()
+    rows = [{"end": v["end"], "val": float(v["val"]), "filed": v.get("filed", "")}
+            for v in node.get("units", {}).get("USD", []) if "start" not in v]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["end"] = pd.to_datetime(df["end"]).dt.date
+    return df.sort_values("filed").drop_duplicates("end", keep="last").reset_index(drop=True)
+
+
+def company_instants(facts: dict, ticker: str) -> pd.DataFrame:
+    """Lease liabilities and total lease payments due at each period end, in USD billions."""
+    frames = []
+    for metric, (taxonomy, concept) in INSTANT_CONCEPTS.items():
+        df = _instants_for(facts, taxonomy, concept)
+        if df.empty:
+            continue
+        frames.append(pd.DataFrame({"ticker": ticker, "metric": metric, "quarter": [quarter_label(e) for e in df["end"]],
+                                    "start": df["end"], "end": df["end"], "value_usd_billion": df["val"] / 1e9,
+                                    "method": "instant", "concept": f"{taxonomy}:{concept}"}))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def quarterly_series(df: pd.DataFrame) -> pd.DataFrame:
@@ -118,6 +159,9 @@ def company_quarterly(facts: dict, ticker: str) -> pd.DataFrame:
         q["value_usd_billion"] = q["value"] / 1e9
         q["quarter"] = [quarter_label(e) for e in q["end"]]
         frames.append(q.drop(columns=["value"]))
+    inst = company_instants(facts, ticker)
+    if not inst.empty:
+        frames.append(inst)
     if not frames:
         return pd.DataFrame(columns=["ticker", "metric", "quarter", "start", "end", "value_usd_billion", "method", "concept"])
     out = pd.concat(frames, ignore_index=True)

@@ -154,7 +154,7 @@ def test_dashboard_renders_every_tab_on_demo_data(tmp_path, monkeypatch):
     monkeypatch.chdir(ROOT)
     at = streamlit_testing.AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=120).run()
     assert not at.exception, [e.value for e in at.exception]
-    assert [t.label for t in at.tabs] == ["Overview", "Capex", "Guidance", "Power & capacity", "Contracts & financing",
+    assert [t.label for t in at.tabs] == ["Overview", "Signals", "Capex", "Guidance", "Power & capacity", "Contracts & financing",
                                           "Company profile", "All disclosures", "Methodology"]
     for name in at.selectbox(key="profile").options:
         at.selectbox(key="profile").set_value(name).run()
@@ -196,3 +196,35 @@ def test_lease_series_keeps_dated_totals():
     s = A.lease_series(disc)
     assert s["value"].tolist() == [85.1, 92.7]
     assert s["as_of"].tolist() == [pd.Timestamp("2023-12-31"), pd.Timestamp("2025-06-30")]
+
+
+def test_lease_series_adds_operating_and_finance_parts():
+    q = "we had additional operating and finance leases that had not yet commenced of $7.5 billion and $85.1 billion, respectively."
+    disc = A.disclosures(pd.DataFrame([
+        fact(metric="lease_not_commenced", unit="USD_billion", value=7.5, period="as of December 31, 2023", quote=q),
+        fact(metric="lease_not_commenced", unit="USD_billion", value=85.1, period="as of December 31, 2023", quote=q),
+    ]))
+    assert A.lease_series(disc)["value"].tolist() == [pytest.approx(92.6)]
+
+
+def test_lease_flows_and_projection():
+    pools = [("2026-03-31", 100.0), ("2026-06-30", 130.0), ("2026-09-30", 150.0)]
+    disc = A.disclosures(pd.DataFrame([
+        fact(ticker="T", metric="lease_not_commenced", unit="USD_billion", value=v, doc_id=d,
+             period=f"as of {pd.Timestamp(d):%B %d, %Y}") for d, v in pools]))
+    xq = pd.DataFrame(
+        [{"ticker": "T", "metric": "lease_starts_operating", "end": d, "value_usd_billion": 8.0} for d, _ in pools]
+        + [{"ticker": "T", "metric": m, "end": "2026-03-31", "value_usd_billion": v}
+           for m, v in (("lease_liability_operating", 10.0), ("lease_payments_operating", 12.5))])
+    fl = A.lease_flows(xq, disc).set_index("end")
+    row = fl.loc[pd.Timestamp("2026-06-30")]
+    assert row["factor"] == pytest.approx(1.25) and row["starts"] == pytest.approx(10.0)
+    assert row["signed"] == pytest.approx(130 - 100 + 10)
+    proj, params = A.lease_projection(fl.reset_index(), lag=1)
+    p = params.iloc[0]
+    # starts(t) = rate * pool(t-1): rate = (10 + 10) / (100 + 130)
+    assert p["rate"] == pytest.approx(20 / 230) and p["signed_avg"] == pytest.approx((40 + 30) / 2)
+    runoff = proj[proj["case"] == "No new signings"]["starts"].tolist()
+    assert runoff[0] == pytest.approx(150 * p["rate"]) and runoff[1] < runoff[0]
+    cont = proj[proj["case"] == "Signings continue"]["starts"].tolist()
+    assert cont[0] == pytest.approx(runoff[0]) and cont[1] > runoff[1]

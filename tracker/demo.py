@@ -37,6 +37,11 @@ def _quarter_ends(start_year: int = 2023, n: int = 15) -> list[date]:
     return out
 
 
+def lease_pool(ticker: str, i: int) -> float:
+    """Demo signed-but-not-started leases for quarter ``i`` of the last six, in USD billions."""
+    return round(40 + 18 * i + 9 * ("HYP1", "HYP2", "HYP3").index(ticker), 1)
+
+
 def build_demo(path: Path) -> Path:
     if path.exists():
         path.unlink()
@@ -57,6 +62,16 @@ def build_demo(path: Path) -> Path:
                 xb.append({"ticker": t, "metric": metric, "quarter": f"{e.year}Q{(e.month - 1) // 3 + 1}",
                            "start": e - timedelta(days=90), "end": e, "value_usd_billion": round(v, 3),
                            "method": "reported" if i % 4 == 0 else "derived", "concept": "demo"})
+    # Leases: starts each quarter (present value) and balance-sheet totals, for the Signals tab.
+    for t in ("HYP1", "HYP2", "HYP3"):
+        for i, e in enumerate(ends[-6:]):
+            rows = {"lease_starts_operating": 0.06 * lease_pool(t, i) / 1.3, "lease_liability_operating": 20 + 3 * i,
+                    "lease_payments_operating": (20 + 3 * i) * 1.3}
+            for metric, v in rows.items():
+                xb.append({"ticker": t, "metric": metric, "quarter": f"{e.year}Q{(e.month - 1) // 3 + 1}",
+                           "start": e if "starts" not in metric else e - timedelta(days=90), "end": e,
+                           "value_usd_billion": round(v, 3), "method": "instant" if "starts" not in metric else "reported",
+                           "concept": "demo"})
     store.upsert("xbrl_quarterly", pd.DataFrame(xb))
 
     facts, filings, docs = [], [], []
@@ -106,10 +121,10 @@ def build_demo(path: Path) -> Path:
                 low=float(low), high=float(high), change=change)
 
     for t in guidance:
-        for i in range(6):
-            filed = date(2025, 5, 1) + timedelta(days=91 * i)
-            as_of = (filed - timedelta(days=31)).isoformat()
-            amount = round(40 + 18 * i + 9 * list(guidance).index(t), 1)
+        for i, end in enumerate(ends[-6:]):
+            filed = end + timedelta(days=35)
+            as_of = end.isoformat()
+            amount = lease_pool(t, i)
             add(t, filed, "lease_not_commenced", amount, "USD_billion", f"as of {as_of}",
                 f"As of quarter end, we had additional leases, primarily for data centers, that had not yet "
                 f"commenced of ${amount} billion.", as_of=as_of)
