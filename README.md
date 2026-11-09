@@ -17,7 +17,7 @@ Hyperscalers: Microsoft, Alphabet, Amazon, Meta, Oracle. Neoclouds: CoreWeave, N
 
 ```bash
 cd gpu-capex-tracker
-python3 -m venv .venv && source .venv/bin/activate
+python3.13 -m venv .venv && source .venv/bin/activate   # Python 3.10+; macOS's built-in python3 is 3.9 (brew install python@3.13)
 pip install -r requirements.txt
 cp .env.example .env
 open -e .env        # add SEC_USER_AGENT (your name and email) and ANTHROPIC_API_KEY

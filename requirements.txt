@@ -1,6 +1,6 @@
 # Dashboard (pinned to the versions it is tested with; Streamlit Community Cloud installs these)
-streamlit==1.50.0
-altair==5.5.0
+streamlit==1.52.2
+altair==6.0.0
 duckdb==1.4.5
 pandas>=2.2,<3
 numpy>=1.26,<3
