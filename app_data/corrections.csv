@@ -1,2 +1,9 @@
 fact_id,action,reason,date
 d20e48670011cbc2,exclude,"Leases Microsoft has signed as tenant (mainly data centers still under construction) whose terms have not yet commenced; a future lease commitment, not a customer contract",2026-11-08
+0de9087cb7794d78,exclude,"Net cash capex (after partner funding); Oracle's other capex guidance is gross, so mixing the two shows a false revision",2026-11-09
+38134a691cb4838c,exclude,"Oracle's $20-25B is expected repayments, not capex guidance",2026-11-09
+7e1657fe7cedc174,exclude,"Net cash capex (after partner funding); Oracle's other capex guidance is gross, so mixing the two shows a false revision",2026-11-09
+019d370554dad208,exclude,"Net cash capex (after partner funding); Oracle's other capex guidance is gross, so mixing the two shows a false revision",2026-11-09
+c496be78307ef519,exclude,"Oracle said FY2026 capex would be about $15B higher than its earlier forecast; $15B is the increase, not the guidance",2026-11-09
+065da6b32916b468,exclude,"Capex for the remainder of IREN's fiscal year, not the full year, so it is not comparable with its full-year guidance",2026-11-09
+5175b487586f4b20,exclude,"AI Cloud Services revenue of $0.6 million read as $0.6 billion (table in millions); the same quarter is recorded correctly from the text",2026-11-09

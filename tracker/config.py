@@ -65,6 +65,12 @@ START_DATE = os.environ.get("TRACKER_START_DATE", "2024-01-01")
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "")
 SEC_MAX_RPS = 8.0  # SEC fair-access limit is 10 requests per second
 
+# Earnings call transcripts from the Equibles API (free tier: 100 requests a day). Optional.
+TRANSCRIPT_API_KEY = os.environ.get("TRANSCRIPT_API_KEY") or os.environ.get("EQUIBLES_API_KEY", "")
+TRANSCRIPT_SINCE = os.environ.get("TRANSCRIPT_SINCE", "2024-10-01")
+# Requests per run; the free tier allows 100 a day. Raise it (e.g. 1000) on a paid plan.
+TRANSCRIPT_MAX_REQUESTS = int(os.environ.get("TRANSCRIPT_MAX_REQUESTS", "95"))
+
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 # Thinking effort for extraction: low | medium | high | xhigh | max. Low keeps a full run within a ~$20 budget.
 ANTHROPIC_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "low")
@@ -117,6 +123,19 @@ METRICS: dict[str, dict] = {
         "desc": "Leases the company has signed as tenant (mostly data centers still under construction) whose terms "
                 "have not yet commenced: total future lease payments as of a date. Not a customer contract.",
     },
+    "cloud_revenue": {
+        "label": "Cloud revenue",
+        "unit": "USD_billion",
+        "desc": "Revenue of the company's cloud / AI-infrastructure business for a single quarter: AWS, Google Cloud, "
+                "Microsoft Intelligent Cloud or Microsoft Cloud, Oracle cloud infrastructure (OCI) or total cloud; for "
+                "neoclouds, total revenue. The segment is named in 'segment'.",
+    },
+    "cloud_growth_pct": {
+        "label": "Cloud revenue growth",
+        "unit": "percent",
+        "desc": "Stated year-over-year growth of a cloud business for a single quarter, e.g. 'Azure and other cloud "
+                "services revenue grew 40%'. The segment is named in 'segment'.",
+    },
     "financing": {
         "label": "Financing",
         "unit": "USD_billion",
@@ -124,4 +143,4 @@ METRICS: dict[str, dict] = {
     },
 }
 
-UNITS = ("USD_billion", "MW", "GPU_count")
+UNITS = ("USD_billion", "MW", "GPU_count", "percent")

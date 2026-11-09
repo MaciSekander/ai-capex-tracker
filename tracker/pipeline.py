@@ -3,9 +3,11 @@
     python -m tracker.pipeline companies          resolve tickers to SEC CIKs
     python -m tracker.pipeline xbrl               quarterly capex and operating cash flow
     python -m tracker.pipeline filings            list 8-K/6-K filings and download exhibits
+    python -m tracker.pipeline transcripts        load earnings call transcripts (data/transcripts/<TICKER>/)
     python -m tracker.pipeline extract            run LLM extraction on new documents
     python -m tracker.pipeline run                all of the above, in order
     python -m tracker.pipeline regrade            re-run the source checks on stored facts (no API calls)
+    python -m tracker.pipeline check              consistency checks across outputs (no API calls)
     python -m tracker.pipeline status             row counts and extraction coverage
     python -m tracker.pipeline review-sheet       sample documents for human review
     python -m tracker.pipeline import-reviews F   load a filled review sheet
@@ -108,20 +110,42 @@ def cmd_filings(store: Store, client: EdgarClient, args) -> None:
 
 
 def cmd_extract(store: Store, args) -> None:
-    where = "d.relevant_chars > 0" + ("" if args.redo else " AND d.extracted_at IS NULL")
+    metrics = [m.strip() for m in args.metrics.split(",")] if getattr(args, "metrics", None) else None
+    if metrics:
+        bad = [m for m in metrics if m not in config.METRICS]
+        if bad:
+            raise SystemExit(f"Unknown metrics: {', '.join(bad)}")
+    # A targeted re-read (--metrics) runs on documents already extracted and adds only those metrics.
+    where = "d.relevant_chars > 0" + ("" if (args.redo or metrics) else " AND d.extracted_at IS NULL")
     if args.tickers:
         tick = ",".join(f"'{t.strip().upper()}'" for t in args.tickers.split(","))
         where += f" AND d.ticker IN ({tick})"
+    if getattr(args, "forms", None):
+        forms = ",".join(f"'{f.strip()}'" for f in args.forms.split(","))
+        where += f" AND f.form IN ({forms})"
+    if getattr(args, "filed_since", None):
+        where += f" AND f.filing_date >= DATE '{args.filed_since}'"
     todo = store.df(
         f"""SELECT d.doc_id, d.accession, d.ticker, d.doc_type, d.description, d.url, d.text, d.relevant_chars,
                    f.form, f.filing_date, c.name AS company
             FROM documents d JOIN filings f USING (accession) JOIN companies c ON c.ticker = d.ticker
             WHERE {where} ORDER BY f.filing_date DESC"""
     )
+    if getattr(args, "match", None):
+        import re
+
+        pat = re.compile(args.match, re.IGNORECASE)
+        todo = todo[todo["text"].map(lambda t: bool(pat.search(t or "")))]
     if args.limit:
         todo = todo.head(args.limit)
+    pattern = extract.CLOUD_KEYWORDS if metrics and all(m.startswith("cloud_") for m in metrics) else None
+    if pattern is not None:
+        todo = todo.assign(relevant_chars=[sum(len(c) for c in extract.relevant_chunks(t or "", pattern=pattern))
+                                           for t in todo["text"]])
+        todo = todo[todo["relevant_chars"] > 0]
     tokens = int(todo["relevant_chars"].sum() / 4)
-    log(f"{len(todo)} documents to extract, about {tokens:,} input tokens of filing text")
+    log(f"{len(todo)} documents to extract, about {tokens:,} input tokens of filing text"
+        + (f" (only {', '.join(metrics)})" if metrics else ""))
     if args.dry_run or todo.empty:
         return
     client = extract.make_client()
@@ -131,20 +155,95 @@ def cmd_extract(store: Store, args) -> None:
         meta = {"company": d.company, "ticker": d.ticker, "form": d.form, "filing_date": str(d.filing_date)[:10],
                 "doc_type": d.doc_type, "description": d.description, "doc_id": d.doc_id}
         try:
-            facts = extract.extract_document(client, meta, d.text, model)
+            facts = extract.extract_document(client, meta, d.text, model, metrics=metrics, pattern=pattern)
         except Exception as exc:
             log(f"  [{i}/{len(todo)}] {d.ticker} {d.doc_id}: failed ({exc}); will retry next run")
             continue
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         rows = [{**f, "doc_id": d.doc_id, "accession": d.accession, "ticker": d.ticker, "filing_date": d.filing_date,
                  "form": d.form, "url": d.url, "model": model, "extracted_at": now} for f in facts]
-        store.con.execute("DELETE FROM facts WHERE doc_id = ?", [d.doc_id])
-        store.upsert("facts", pd.DataFrame(rows))
-        store.con.execute("UPDATE documents SET extracted_at = ?, model = ? WHERE doc_id = ?", [now, model, d.doc_id])
+        if metrics:  # replace only these metrics for the document; everything else stays as extracted
+            store.con.execute(f"DELETE FROM facts WHERE doc_id = ? AND metric IN ({','.join('?' * len(metrics))})",
+                              [d.doc_id, *metrics])
+            store.upsert("facts", pd.DataFrame(rows))
+        else:
+            store.con.execute("DELETE FROM facts WHERE doc_id = ?", [d.doc_id])
+            store.upsert("facts", pd.DataFrame(rows))
+            store.con.execute("UPDATE documents SET extracted_at = ?, model = ? WHERE doc_id = ?", [now, model, d.doc_id])
         total += len(facts)
         verified = sum(f["status"] == "verified" for f in facts)
         log(f"  [{i}/{len(todo)}] {d.ticker} {d.doc_id}: {len(facts)} facts, {verified} verified")
     log(f"Done: {total} facts")
+
+
+def cmd_transcripts(store: Store, args) -> None:
+    """Fetch Microsoft's transcripts, then load every transcript in data/transcripts/ (no API calls)."""
+    from datetime import date
+
+    from . import transcripts
+
+    since = date.fromisoformat(args.since or config.START_DATE)
+    msft = store.df("SELECT filing_date FROM filings WHERE ticker = 'MSFT' AND form = '8-K' AND items LIKE '%2.02%'")
+    if not msft.empty and (not args.tickers or "MSFT" in args.tickers.upper()):
+        saved = transcripts.fetch_microsoft([d.date() for d in pd.to_datetime(msft["filing_date"])], since, date.today())
+        log(f"  Microsoft: {len(saved)} new transcripts downloaded")
+    key = config.TRANSCRIPT_API_KEY
+    if key and not getattr(args, "no_download", False):
+        wanted = [t.strip().upper() for t in args.tickers.split(",")] if args.tickers else None
+        wanted = [t for t in (wanted or transcripts.EQUIBLES_ORDER) if t != "MSFT"]
+        log("  Downloading transcripts from Equibles")
+        c = transcripts.fetch_equibles(key, date.fromisoformat(config.TRANSCRIPT_SINCE), wanted,
+                                       max_requests=config.TRANSCRIPT_MAX_REQUESTS, log=log)
+        log(f"  Equibles: {c['saved']} saved, {c['already']} already saved, {c['unavailable']} unavailable, "
+            f"{c['requests']} requests" + (f"; {c['stopped']} - run again tomorrow to continue" if c["stopped"] else ""))
+    items = [t for t in transcripts.scan() if t["call_date"] >= since]
+    if args.tickers:
+        keep = {t.strip().upper() for t in args.tickers.split(",")}
+        items = [t for t in items if t["ticker"] in keep]
+    known = set(store.df("SELECT doc_id FROM documents")["doc_id"])
+    companies = set(store.df("SELECT ticker FROM companies")["ticker"])
+    unknown = sorted({t["ticker"] for t in items} - companies)
+    if unknown:
+        log(f"  skipped folders for untracked tickers: {', '.join(unknown)}")
+        items = [t for t in items if t["ticker"] in companies]
+    filings, docs = transcripts.to_rows(
+        items, known, lambda text: sum(len(c) for c in extract.relevant_chunks(text, form=transcripts.FORM)))
+    store.upsert("filings", filings)
+    n = store.upsert("documents", docs)
+    by_ticker = pd.Series([t["ticker"] for t in items]).value_counts().to_dict() if items else {}
+    log(f"  {len(items)} transcripts found {by_ticker}; {n} new")
+
+
+def cmd_check(store: Store, args) -> None:
+    """Consistency checks across outputs (the dashboard's Automatic checks), printed by severity. No API calls."""
+    from . import analytics as A
+    from . import checks as C
+
+    facts = store.df("SELECT * FROM facts WHERE status = 'verified'")
+    if facts.empty:
+        log("No facts.")
+        return
+    facts["filing_date"] = pd.to_datetime(facts["filing_date"])
+    try:
+        cor = pd.read_csv(config.CORRECTIONS_PATH, dtype=str).fillna("")
+    except FileNotFoundError:
+        cor = pd.DataFrame()
+    facts = A.drop_periodic_deals(A.apply_corrections(facts, cor))
+    groups = dict(store.df("SELECT ticker, grp FROM companies").itertuples(index=False))
+    disc = A.disclosures(facts).assign(group=lambda d: d["ticker"].map(groups))
+    xq = store.table("xbrl_quarterly")
+    issues = C.run_checks(facts, disc, A.guidance_history(facts), A.capex_quarterly(xq, facts),
+                          A.lease_flows(xq, disc), A.cloud_revenue(facts), A.cloud_growth(facts),
+                          pd.to_datetime(store.df("SELECT max(filing_date) d FROM filings")["d"].iloc[0]))
+    if issues.empty:
+        log("No findings.")
+        return
+    for sev in ("High", "Medium", "Low"):
+        part = issues[issues["severity"] == sev]
+        if len(part):
+            log(f"{sev}: {len(part)}")
+            for r in part.itertuples():
+                print(f"  {r.ticker:6} {r.area:14} {r.finding}")
 
 
 def cmd_regrade(store: Store, args) -> None:
@@ -188,7 +287,7 @@ def cmd_status(store: Store, args) -> None:
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="python -m tracker.pipeline", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["companies", "xbrl", "filings", "extract", "run", "regrade", "status", "review-sheet",
+    p.add_argument("command", choices=["companies", "xbrl", "filings", "transcripts", "extract", "check", "run", "regrade", "status", "review-sheet",
                                        "import-reviews", "eval", "publish", "export-csv", "demo"])
     p.add_argument("path", nargs="?", help="review sheet path for import-reviews")
     p.add_argument("--tickers", help="comma-separated subset, e.g. MSFT,CRWV")
@@ -196,6 +295,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--limit", type=int, help="max documents to extract this run")
     p.add_argument("--model", help=f"Anthropic model (default {config.ANTHROPIC_MODEL})")
     p.add_argument("--redo", action="store_true", help="re-extract documents already done")
+    p.add_argument("--forms", help="extract only these filing forms, e.g. 8-K,6-K or Transcript")
+    p.add_argument("--filed-since", help="extract only documents filed on or after this date (YYYY-MM-DD)")
+    p.add_argument("--metrics", help="re-read documents for these metrics only, e.g. cloud_revenue,cloud_growth_pct")
+    p.add_argument("--match", help="extract only documents whose text matches this regular expression")
+    p.add_argument("--no-download", action="store_true", help="transcripts: only load files already in the folder")
     p.add_argument("--dry-run", action="store_true", help="count documents and tokens without calling the API")
     p.add_argument("--docs", type=int, default=25, help="documents in the review sheet")
     p.add_argument("--db", help="DuckDB path (default data/tracker.duckdb)")
@@ -220,8 +324,12 @@ def main(argv: list[str] | None = None) -> None:
                 log("Filings and exhibits"); cmd_filings(store, client, args)
             if args.command == "run":
                 log("LLM extraction"); cmd_extract(store, args)
+        elif args.command == "transcripts":
+            log("Earnings call transcripts"); cmd_transcripts(store, args)
         elif args.command == "extract":
             cmd_extract(store, args)
+        elif args.command == "check":
+            cmd_check(store, args)
         elif args.command == "regrade":
             cmd_regrade(store, args)
         elif args.command == "status":

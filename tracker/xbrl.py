@@ -41,6 +41,9 @@ INSTANT_CONCEPTS = {
     "lease_liability_finance": ("us-gaap", "FinanceLeaseLiability"),
     "lease_payments_operating": ("us-gaap", "LesseeOperatingLeaseLiabilityPaymentsDue"),
     "lease_payments_finance": ("us-gaap", "FinanceLeaseLiabilityPaymentsDue"),
+    # Lease assets, to estimate quarterly lease starts where a company reports them only for the full year.
+    "lease_rou_operating": ("us-gaap", "OperatingLeaseRightOfUseAsset"),
+    "lease_rou_finance_gross": ("us-gaap", "FinanceLeaseRightOfUseAssetBeforeAccumulatedAmortization"),
 }
 
 # Used only when a company reports none of the concepts above (Hut 8 tags capex this way).
@@ -159,6 +162,17 @@ def company_quarterly(facts: dict, ticker: str) -> pd.DataFrame:
         q["value_usd_billion"] = q["value"] / 1e9
         q["quarter"] = [quarter_label(e) for e in q["end"]]
         frames.append(q.drop(columns=["value"]))
+    # Full-year lease starts, for companies that stop tagging quarters (Meta reports them in the 10-K only).
+    for metric, [(taxonomy, concept)] in LEASE_FLOW_CONCEPTS.items():
+        df = _facts_for(facts, taxonomy, concept)
+        if df.empty:
+            continue
+        fy = df[[350 <= (e - s_).days <= 380 for s_, e in zip(df["start"], df["end"])]]
+        if not fy.empty:
+            frames.append(pd.DataFrame({"ticker": ticker, "metric": f"{metric}_fy",
+                                        "quarter": [quarter_label(e) for e in fy["end"]], "start": fy["start"],
+                                        "end": fy["end"], "value_usd_billion": fy["val"] / 1e9, "method": "annual",
+                                        "concept": f"{taxonomy}:{concept}"}))
     inst = company_instants(facts, ticker)
     if not inst.empty:
         frames.append(inst)

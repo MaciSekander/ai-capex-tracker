@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS facts (
     fact_id VARCHAR PRIMARY KEY, doc_id VARCHAR, accession VARCHAR, ticker VARCHAR, filing_date DATE,
     form VARCHAR, url VARCHAR, metric VARCHAR, value DOUBLE, value_low DOUBLE, value_high DOUBLE,
     unit VARCHAR, period VARCHAR, as_of_date VARCHAR, change VARCHAR, counterparty VARCHAR, site VARCHAR,
-    instrument VARCHAR, term_years DOUBLE, quote VARCHAR, confidence DOUBLE, quote_match VARCHAR,
+    instrument VARCHAR, term_years DOUBLE, expected_date VARCHAR, segment VARCHAR, quote VARCHAR, confidence DOUBLE, quote_match VARCHAR,
     value_in_quote BOOLEAN, status VARCHAR, model VARCHAR, extracted_at TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS reviews (
@@ -57,6 +57,9 @@ class Store:
         self.con = duckdb.connect(str(self.path), read_only=read_only)
         if not read_only:
             self.con.execute(SCHEMA)
+            # Columns added after the first release.
+            self.con.execute("ALTER TABLE facts ADD COLUMN IF NOT EXISTS expected_date VARCHAR")
+            self.con.execute("ALTER TABLE facts ADD COLUMN IF NOT EXISTS segment VARCHAR")
 
     def close(self):
         self.con.close()

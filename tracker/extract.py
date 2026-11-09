@@ -38,7 +38,7 @@ PERIODIC_KEYWORDS = re.compile(
 
 MAX_CHUNK_CHARS = 18_000
 
-SYSTEM_PROMPT = """You extract structured facts about AI infrastructure investment from SEC filings and press releases.
+SYSTEM_PROMPT = """You extract structured facts about AI infrastructure investment from SEC filings, press releases and earnings call transcripts.
 
 Record a fact only when the text states it explicitly about the filing company (or its named subsidiaries). Do not record industry statistics, analyst estimates, or numbers about other companies except as the counterparty to the filer's own contract or financing.
 
@@ -47,20 +47,41 @@ Metrics:
 
 Rules:
 - One fact per distinct number. A range like "$90 to $100 billion" is one fact with value_low, value_high, and value = midpoint.
-- Units are canonical: money in USD billions ($850 million = 0.85), power in MW (1.2 GW = 1200), GPUs as a count.
+- Units are canonical: money in USD billions ($850 million = 0.85), power in MW (1.2 GW = 1200), GPUs as a count, growth rates in percent (40% = 40).
+- site: for cloud_revenue and cloud_growth_pct, put the business line here in the company's words ("AWS", "Google Cloud", "Intelligent Cloud", "Microsoft Cloud", "Azure", "Oracle Cloud Infrastructure", "total"); otherwise the physical site, if named.
+- cloud_revenue and cloud_growth_pct are for a single quarter only, never year-to-date or full-year figures; record the prior-year comparison quarter only if the text gives its own number for it, with its own period.
 - period: the period the number refers to, in the company's words, e.g. "FY2026", "Q3 2025", "calendar 2026", "as of September 30, 2025".
 - as_of_date: YYYY-MM-DD when the text gives a date for a point-in-time number, else null.
+- expected_date: for capacity, a site, a project or a lease, when the company expects it to be online, energized or to commence, in its words (e.g. "Q2 2027", "by end of 2026", "2027 and 2028"); else null.
 - change: for guidance, "raised", "lowered", "reaffirmed" or "new" only if the text says so; otherwise "not_stated".
 - quote: copy the exact sentence or table row that states the number, verbatim, at most 300 characters. Do not paraphrase.
 - confidence: 0 to 1, your confidence the fact is correctly read.
 - customer_contract is revenue the filer will earn from a customer. Leases the filer signed as tenant are never customer_contract; if they have not yet commenced, record them as lease_not_commenced.
 - In 10-Q, 10-K and 20-F reports, record capex_reported only for the filer's total for the period, not segments.
+- In earnings call transcripts, record only statements made by the company's executives, never analysts' questions or estimates. Spoken guidance counts as capex_guidance.
 - If nothing qualifies, return an empty list. Never guess.
 """
 
 
-def metric_lines() -> str:
-    return "\n".join(f"- {k} ({v['unit']}): {v['desc']}" for k, v in config.METRICS.items())
+def metric_lines(metrics=None) -> str:
+    return "\n".join(f"- {k} ({v['unit']}): {v['desc']}" for k, v in config.METRICS.items()
+                     if metrics is None or k in metrics)
+
+
+def tool_for(metrics=None) -> dict:
+    """The record_facts tool, optionally limited to some metrics (for a targeted re-read)."""
+    if metrics is None:
+        return TOOL
+    import copy
+
+    t = copy.deepcopy(TOOL)
+    t["input_schema"]["properties"]["facts"]["items"]["properties"]["metric"]["enum"] = list(metrics)
+    return t
+
+
+# Paragraphs that state cloud revenue or its growth.
+CLOUD_KEYWORDS = re.compile(
+    r"\bcloud\b|azure|\baws\b|amazon web services|\bOCI\b|\bIaaS\b|revenue", re.IGNORECASE)
 
 
 TOOL = {
@@ -87,6 +108,7 @@ TOOL = {
                         "site": {"type": ["string", "null"]},
                         "instrument": {"type": ["string", "null"]},
                         "term_years": {"type": ["number", "null"]},
+                        "expected_date": {"type": ["string", "null"]},
                         "quote": {"type": "string"},
                         "confidence": {"type": "number"},
                     },
@@ -106,9 +128,9 @@ TOOL = {
 # ---------------------------------------------------------------------------
 
 
-def relevant_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS, form: str | None = None) -> list[str]:
+def relevant_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS, form: str | None = None, pattern=None) -> list[str]:
     """Paragraphs that match the keywords for this form, plus one paragraph either side, packed into chunks."""
-    pattern = PERIODIC_KEYWORDS if form in config.PERIODIC_FORMS else KEYWORDS
+    pattern = pattern or (PERIODIC_KEYWORDS if form in config.PERIODIC_FORMS else KEYWORDS)
     paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     keep = set()
     for i, p in enumerate(paras):
@@ -143,16 +165,17 @@ def build_prompt(meta: dict, chunk: str) -> str:
     )
 
 
-def call_model(client: Any, prompt: str, model: str | None = None, max_retries: int = 5) -> list[dict]:
+def call_model(client: Any, prompt: str, model: str | None = None, max_retries: int = 5, metrics=None) -> list[dict]:
     model = model or config.ANTHROPIC_MODEL
-    system = [{"type": "text", "text": SYSTEM_PROMPT.format(metrics=metric_lines()), "cache_control": {"type": "ephemeral"}}]
+    system = [{"type": "text", "text": SYSTEM_PROMPT.format(metrics=metric_lines(metrics)),
+               "cache_control": {"type": "ephemeral"}}]
     for attempt in range(max_retries):
         try:
             resp = client.messages.create(
                 model=model,
                 max_tokens=4096,
                 system=system,
-                tools=[TOOL],
+                tools=[tool_for(metrics)],
                 # Current models reject forced tool_choice ("tool"/"any"); the prompt asks for the call instead.
                 tool_choice={"type": "auto"},
                 output_config={"effort": config.ANTHROPIC_EFFORT},
@@ -223,6 +246,7 @@ _SCALE = {
                     "thousand": 1e-6, "k": 1e-6, None: None},
     "MW": {"gigawatt": 1e3, "gigawatts": 1e3, "gw": 1e3, "megawatt": 1.0, "megawatts": 1.0, "mw": 1.0, None: 1.0},
     "GPU_count": {"million": 1e6, "thousand": 1e3, "k": 1e3, "m": 1e6, None: 1.0},
+    "percent": {None: 1.0},
 }
 
 
@@ -301,6 +325,9 @@ def clean_fact(f: dict) -> dict | None:
     unit = config.METRICS[f["metric"]]["unit"]
     out = {k: f.get(k) for k in TOOL["input_schema"]["properties"]["facts"]["items"]["properties"]}
     out["unit"] = unit
+    # The tool schema has no room for another field, so cloud metrics carry their business line in "site".
+    if f["metric"] in ("cloud_revenue", "cloud_growth_pct"):
+        out["segment"], out["site"] = out.get("site"), None
     if out.get("value") is None and out.get("value_low") is not None and out.get("value_high") is not None:
         out["value"] = (out["value_low"] + out["value_high"]) / 2
     if out.get("value") is None and f["metric"] not in ("customer_contract",):
@@ -318,13 +345,14 @@ def fact_id(doc_id: str, f: dict) -> str:
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
-def extract_document(client: Any, meta: dict, text: str, model: str | None = None) -> list[dict]:
-    """All grounded facts for one document."""
+def extract_document(client: Any, meta: dict, text: str, model: str | None = None, metrics=None,
+                     pattern=None) -> list[dict]:
+    """All grounded facts for one document (only ``metrics`` if given, from paragraphs matching ``pattern``)."""
     facts, seen = [], set()
-    for chunk in relevant_chunks(text, form=meta.get("form")):
-        for raw in call_model(client, build_prompt(meta, chunk), model):
+    for chunk in relevant_chunks(text, form=meta.get("form"), pattern=pattern):
+        for raw in call_model(client, build_prompt(meta, chunk), model, metrics=metrics):
             f = clean_fact(raw)
-            if f is None:
+            if f is None or (metrics is not None and f["metric"] not in metrics):
                 continue
             g = ground(f, text)
             g["fact_id"] = fact_id(meta["doc_id"], g)

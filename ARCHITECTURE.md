@@ -34,6 +34,8 @@ gpu-capex-tracker/
 │   ├── store.py           DuckDB tables, publish and export
 │   ├── analytics.py       Derived views for the dashboard (pure pandas)
 │   ├── pipeline.py        Command line entry point
+│   ├── transcripts.py     Earnings call transcripts (folder + Microsoft download)
+│   ├── checks.py          Consistency checks across outputs
 │   ├── evaluate.py        Human review and precision/recall
 │   └── demo.py            Fictional demo database
 ├── tests/
@@ -141,6 +143,17 @@ Options: `--tickers MSFT,CRWV`, `--limit N`, `--model`, `--redo`, `--dry-run`, `
 
 `extract` only processes documents with no `extracted_at` time, so an interrupted run resumes where it stopped. A document that fails is logged and retried on the next run.
 
+### `tracker/transcripts.py`: earnings call transcripts
+
+- Investor sites mostly block automated downloads, so transcripts are read from `data/transcripts/<TICKER>/<YYYY-MM-DD> ….pdf|docx|html|txt`, with an optional `sources.csv` (`file,url`) for the public link.
+- `fetch_equibles()` downloads transcripts from the Equibles API (`TRANSCRIPT_API_KEY`): it lists each company's earnings calls, fetches the speaker turns for each call with a transcript (skipping summary-only records), and writes `<date> <TICKER> FY<year>Q<q>.txt` with speaker labels. It counts requests against the free tier's 100 a day, stops cleanly at the limit and skips files already saved, so the next run resumes.
+- `fetch_microsoft()` downloads Microsoft's Word transcripts (aka.ms/transcriptfy26q1 links), dated by the matching earnings 8-K.
+- `pipeline transcripts` turns each file into a `filings` row (form `Transcript`, accession `TRANSCRIPT-<TICKER>-<date>`) and a `documents` row, so extraction, checking and the dashboard treat it like a filing. The extraction prompt records only executives' statements; deals mentioned on calls are not counted as new deals (`analytics.RESTATING_FORMS`).
+
+### `tracker/checks.py`: consistency checks
+
+The extraction checks prove each number is in its source; these rules look across numbers for results that contradict each other or would mislead. Guidance: a revision whose quote says "higher than", "remainder", "net cash", "repayments" or "per quarter" (likely an increment, partial year or other basis), conflicting figures for one period on one day, guidance below capex already reported, and large moves (noted for confirmation). Leases: backlog falling over 30% in a quarter, negative implied signings. Capacity: active above contracted MW, implausible sizes. Cloud: quarter-on-quarter jumps, stated growth disagreeing with computed growth. Capex: press-release figures far from XBRL for the same quarter (single-quarter, cash-basis statements only). `run_checks()` returns findings by severity; flagged guidance statements are left out of the Overview's revision count and marked in the revision log. `pipeline check` prints them.
+
 ### `tracker/evaluate.py`: measuring accuracy
 
 The automatic checks catch made-up quotes and numbers, but not facts the model missed. A human review loop measures both:
@@ -159,6 +172,12 @@ Pure pandas functions, tested in `tests/test_analytics.py`.
 - **`drop_periodic_deals()`** removes contracts and financings extracted from 10-Q, 10-K and 20-F reports, which restate older deals each quarter; deals come from 8-K and 6-K announcements only.
 - **`lease_flows()`** joins the lease backlog (signed leases not yet commenced, from filing text) with XBRL lease starts (right-of-use assets obtained for new leases, converted from present value to total payments with each company's payments-due / liability ratio) and derives implied new signings: change in backlog + starts.
 - **`lease_projection()`** models starts in a quarter as a fitted share of the backlog four quarters earlier (`LEASE_LAG_QUARTERS`), so the next four quarters follow from disclosed backlog; later quarters run two cases, signings continuing at their recent average or stopping. Used by the Signals tab.
+- **`estimated_lease_starts()`** fills quarters a company stopped reporting (Meta from 2025): change in the operating lease asset plus amortization, and the change in the gross finance lease asset, calibrated so the latest full year matches the reported total. Rows are marked `starts_basis = 'estimated'`.
+- **`lease_backtest()`** refits the lease model on data up to a year before each company's latest quarter and compares its projection with the starts that followed (the Signals tab's track record).
+- **`parse_expected()`, `capacity_schedule()` and `stated_tranches()`** read the `expected_date` the extractor records for capacity and leases ("Q2 2027", "2027 and 2028"). The capacity schedule uses each company's latest statement per site and measures how far dates have slipped since first stated; tranches with their own window are spread over it in the stated-timing projection.
+- **Fiscal calendars.** `FISCAL_YEAR_END_MONTH` lists companies whose year does not end in December (Microsoft, Oracle, IREN, Applied Digital). `period_label(period, ticker)` labels their periods "FY2026" / "Q1 FY2027" unless the text says calendar, so fiscal and calendar guidance are never compared; `quarter_end()` maps a fiscal quarter to its last day (Microsoft Q1 FY2026 = Sep 30, 2025).
+- **Cloud revenue.** `cloud_revenue()` and `cloud_growth()` keep one business line per company (`CLOUD_SEGMENTS`: AWS, Google Cloud, Microsoft Cloud, Oracle OCI with IaaS-plus-SaaS totals excluded; total revenue for CoreWeave and Nebius, AI cloud for IREN) and only the quarter each release reports (not its prior-year comparisons). Segments are matched on the recorded business line, falling back to the quote; an explicit "quarter ended <date>" in the period overrides the label, and fiscal labels map through `FISCAL_YEAR_END_MONTH`. `checks.check_cloud` skips a large quarter-on-quarter move when the quote states that rate or the stated year-over-year growth matches the series. `cloud_summary()` adds last-four-quarter revenue, capex ÷ revenue and new revenue per dollar of capex. Extracted with `pipeline extract --metrics cloud_revenue,cloud_growth_pct`, which re-reads documents for those metrics only and leaves other facts untouched. The business line travels in the tool's `site` field (the strict schema is at its size limit) and is stored as `segment`.
+- **Annual fallback and company timing.** `annual_lease_starts()` uses full-year lease starts (`lease_starts_*_fy`) to fit the pace for companies that stopped tagging quarters (Meta). `stated_windows()` parses the commencement window a company gives with its backlog (Meta: 2026 through 2036; Oracle: fiscal 2027 to 2029, using `FISCAL_YEAR_END_MONTH`), and `lease_projection()` adds a "Company's stated timing" case that spreads the signed backlog evenly over that window.
 - **`xbrl.py`** also stores lease starts (`lease_starts_operating`, `lease_starts_finance`) and point-in-time lease liabilities and payments due (`method = 'instant'`) in `xbrl_quarterly`.
 - **`capex_quarterly()`** returns XBRL quarters plus press-release quarters for companies with no quarterly XBRL, with a `source` column.
 - **`capex_summary()` / `ttm_total()`** compute latest quarter, quarter-on-quarter, year-over-year and last four quarters. Four-quarter totals require four consecutive quarters.

@@ -8,4 +8,5 @@ numpy>=1.26,<3
 anthropic>=0.40
 requests>=2.31
 beautifulsoup4>=4.12
+pypdf>=5.4
 pytest

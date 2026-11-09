@@ -15,14 +15,14 @@ For what each file does, how the checks work and how to browse the database, see
 | Tab | Use it to |
 |---|---|
 | **Overview** | See headline capex, guidance revisions and every disclosure first stated in the last 7, 30 or 90 days |
-| **Signals** | See where spending is heading: the lease pipeline (signed, started, implied new signings), projected lease starts, capex momentum and neocloud funding. Every figure is calculated from the other tabs, with its formula shown |
-| **Capex** | Compare quarterly capex, the capex scorecard (quarter, year-over-year, last four quarters), capex as a share of operating cash flow and signed data-center leases not yet commenced |
+| **Signals** | See where spending is heading, in five sub-tabs: **Leases** (signed, started, implied new signings and projected starts, with the model's track record), **Cloud revenue** (AWS, Google Cloud, Microsoft Cloud, Oracle OCI and neocloud revenue against capex), **Capacity** (MW expected online by site, and slipped dates), **Capex momentum** and **Neocloud funding** |
+| **Capex** | Compare quarterly capex, the capex scorecard (quarter, year-over-year, last four quarters) and capex as a share of operating cash flow |
 | **Guidance** | Follow each company's capex guidance and whether it was raised, lowered or maintained |
 | **Power & capacity** | Compare active, contracted and pipeline MW, GPUs deployed and revenue backlog |
-| **Contracts & financing** | Review customer contracts and debt or equity financings, with counterparties and terms |
-| **Company profile** | See everything on one company: capex, guidance, capacity, latest disclosures and recent filings |
-| **All disclosures** | Search every extracted number by keyword, counterparty or period, and download it |
-| **Methodology** | Read how each number is produced and checked, its limitations, coverage and data quality |
+| **Deals** | Review customer contracts and debt or equity financings, with counterparties and terms |
+| **Companies** | See everything on one company: capex, guidance, capacity, latest disclosures and recent filings |
+| **Explore data** | Search every extracted number by keyword, counterparty or period, and download it |
+| **Methodology** | Read how each number is produced and checked, the automatic consistency checks and their findings, limitations, coverage and data quality |
 
 - **Filters** in the sidebar apply to every tab: company type, companies, which check statuses to include and the earliest filing date.
 - **Hover** over any chart point for the exact quote. The **Source** column in every table opens the SEC filing.
@@ -67,12 +67,40 @@ streamlit run streamlit_app.py                    # now shows real data
 - **Picking up new filings.** Rerun `filings` then `extract`; only new documents are processed. `--tickers MSFT,CRWV` limits any step to a few companies, and `--redo` re-extracts.
 - **Effort and cost.** Extraction runs `claude-sonnet-5-5` at low effort by default (`ANTHROPIC_EFFORT` in `.env`). A full run of about 1,000 press-release documents costs roughly $10; the 140 periodic reports since 2024 cost about $5 more.
 
+## Earnings call transcripts
+
+Transcripts are downloaded automatically from [Equibles](https://equibles.com/earnings-call-transcript-api):
+add a free API key to `.env` as `TRANSCRIPT_API_KEY` (100 requests a day, no card). A full first download is
+about 125 requests, so it stops cleanly at the daily limit; run the command again the next day and it carries on
+where it stopped. Each later quarter needs about 14 requests. On a paid plan, set `TRANSCRIPT_MAX_REQUESTS=1000` in `.env` to fetch everything in one run. Microsoft's transcripts come from its own site.
+
+You can also add transcripts by hand (for a company the API doesn't cover), in the same folder:
+
+```
+data/transcripts/<TICKER>/<YYYY-MM-DD> anything.pdf      # .pdf, .docx, .html, .htm or .txt; the date is the call date
+data/transcripts/<TICKER>/sources.csv                    # optional: file,url  (the public link shown in the dashboard)
+```
+
+Then:
+
+```bash
+python -m tracker.pipeline transcripts                        # download new calls and load the folder (no Claude calls)
+python -m tracker.pipeline extract --forms Transcript --dry-run
+python -m tracker.pipeline extract --forms Transcript         # roughly $0.02 per call
+python -m tracker.pipeline publish
+```
+
+Only statements by company executives are recorded. Contracts and financings mentioned on calls are not
+counted as new deals.
+
 ## Weekly update
 
 ```bash
 python -m tracker.pipeline xbrl                   # new quarters
 python -m tracker.pipeline filings                # new 8-K, 6-K, 10-Q, 10-K and 20-F filings
+python -m tracker.pipeline transcripts            # Microsoft's latest call, plus any transcripts you added
 python -m tracker.pipeline extract                # only new documents
+python -m tracker.pipeline check                  # consistency findings to confirm or correct
 python -m tracker.pipeline publish                # refresh app_data/tracker.duckdb
 git add app_data && git commit -m "Update data" && git push
 ```
@@ -149,7 +177,7 @@ SEC EDGAR ──► companies ──► XBRL company facts ──► xbrl_quarte
 
 ## Known limits
 
-- **Hyperscaler guidance is often oral.** Microsoft, Alphabet and Amazon usually give capex guidance on earnings calls, not in the press release filed with the SEC, so guidance coverage for them will be thin. Earnings call transcripts would be the next source to add.
+- **Hyperscaler guidance is often oral.** Microsoft, Alphabet and Amazon usually give capex guidance on earnings calls, not in the press release filed with the SEC. Microsoft's calls are read automatically; add transcripts for the others (see above) to cover theirs.
 - **Nebius files as a foreign issuer.** Its results come on 6-K and its XBRL uses IFRS tags; both are handled, but check its numbers first.
 - **Capex definitions differ.** Some companies include finance leases or equipment acquired under leases in what they call capex; the XBRL series uses cash paid for property and equipment.
 - **Verified isn't the same as correct.** It means the quote and number are really in the filing. The extracted period or metric could still be wrong, which is what human review measures.

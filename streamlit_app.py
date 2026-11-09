@@ -7,6 +7,7 @@ quarterly capex) come from tracker/analytics.py.
 """
 
 import os
+import re
 from datetime import date
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 from tracker import analytics as A
+from tracker import checks as C
 from tracker import config
 from tracker.evaluate import scores
 
@@ -180,7 +182,9 @@ def download(df: pd.DataFrame, name: str, label="Download CSV"):
 
 
 def source_note(text: str):
-    st.caption(f"**Source and method:** {text}")
+    """How a chart or table is built, behind a small button so the page stays uncluttered."""
+    with st.popover("Source and method", icon=":material/info:"):
+        st.markdown(text)
 
 
 LINK = st.column_config.LinkColumn("Source", display_text="Open filing", width="small")
@@ -215,10 +219,11 @@ since = sb.date_input("Filings since", value=date(2024, 1, 1), key="since")
 sb.divider()
 sb.markdown(
     "**How to use this dashboard**\n\n"
-    "- **Overview** for the headline numbers and what changed recently.\n"
-    "- **Company profile** for everything on one company.\n"
-    "- Every extracted number links to the SEC filing it came from.\n"
-    "- **Methodology** explains how each number is produced and checked."
+    "- **Overview**: headline numbers and what changed recently.\n"
+    "- **Signals**: where spending is heading (leases, cloud revenue, capacity).\n"
+    "- **Companies**: everything on one company.\n"
+    "- **Source and method** buttons explain each chart; every number links to its filing or call.\n"
+    "- **Methodology**: how numbers are checked, and anything flagged for review."
 )
 
 # Filtered views
@@ -247,6 +252,17 @@ if not gh.empty:
 hyp = [t for t in sel_tickers if GROUP.get(t) == "Hyperscaler"]
 others = [t for t in sel_tickers if t not in hyp]
 
+# Consistency checks across outputs (see tracker/checks.py and the Methodology tab).
+_flows_for_checks = A.lease_flows(data["xbrl_quarterly"], disc) if not disc.empty else pd.DataFrame()
+issues = C.run_checks(facts, disc, gh, cq_all, _flows_for_checks, A.cloud_revenue(facts), A.cloud_growth(facts),
+                      data_through) if not facts.empty else pd.DataFrame(columns=C.COLUMNS)
+flagged = C.flagged_revisions(issues)
+n_review = int(issues["severity"].isin(["High", "Medium"]).sum()) if not issues.empty else 0
+if not gh.empty:
+    gh["check"] = [next((f for t_, d_, f in zip(issues["ticker"], issues["date"], issues["finding"])
+                         if t_ == t and d_ == d.normalize() and f), "") if (t, d.normalize()) in flagged else ""
+                   for t, d in zip(gh["ticker"], gh["filing_date"])] if not issues.empty else ""
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
@@ -264,6 +280,8 @@ st.caption(
     f"{len(A.disclosures(facts_all[facts_all['status'] == 'verified'])):,} verified disclosures from "
     f"{facts_all['doc_id'].nunique():,} documents"
     + (f" · last updated {last_run:%b %d, %Y}" if last_run is not None and last_run == last_run else "")
+    + (f" · :orange[{n_review} item{'s' if n_review != 1 else ''} flagged by automatic checks] (Methodology tab)"
+       if n_review else " · automatic consistency checks passed")
 )
 if is_demo:
     st.warning("Demo data: every company, number and quote here is fictional. Run the pipeline to load real filings.")
@@ -271,8 +289,8 @@ if not sel_tickers:
     st.info("Select at least one company in the sidebar.")
     st.stop()
 
-tabs = st.tabs(["Overview", "Signals", "Capex", "Guidance", "Power & capacity", "Contracts & financing", "Company profile",
-                "All disclosures", "Methodology"])
+tabs = st.tabs(["Overview", "Signals", "Capex", "Guidance", "Power & capacity", "Deals", "Companies",
+                "Explore data", "Methodology"])
 
 # ---------------------------------------------------------------------------
 # Overview
@@ -285,6 +303,8 @@ with tabs[0]:
                   if (ocf_q["ticker"] == t).sum() >= 4)
     other_ttm, other_prev = A.ttm_total(cq_all, others), A.ttm_total(cq_all, others, 4)
     recent_g = gh[gh["filing_date"] >= data_through - pd.Timedelta(days=120)] if not gh.empty else gh
+    if len(recent_g):  # flagged statements are not counted as revisions until confirmed
+        recent_g = recent_g[[(t, d.normalize()) not in flagged for t, d in zip(recent_g["ticker"], recent_g["filing_date"])]]
     n_raised = int((recent_g["revision"] == "raised").sum()) if len(recent_g) else 0
     n_lowered = int((recent_g["revision"] == "lowered").sum()) if len(recent_g) else 0
 
@@ -331,9 +351,15 @@ with tabs[0]:
             st.info("No capex guidance for the current selection.")
         else:
             lg = A.latest_guidance(gh)
-            annual = lg[lg["period_label"].str.fullmatch(r"\d{4}")]
-            cur = annual[annual["period_label"].astype(int) >= data_through.year]
-            lg = (cur if not cur.empty else annual).sort_values("value", ascending=False)
+            annual = lg[lg["period_label"].str.fullmatch(r"(?:FY)?\d{4}")].copy()
+            # One row per company: its most recent guidance for a year that has not ended yet (on the
+            # company's own fiscal calendar, so Oracle's FY2026, which ended May 2026, drops out).
+            annual["year_end"] = [pd.Timestamp(year=int(p_[-4:]), month=A.FISCAL_YEAR_END_MONTH.get(t, 12), day=1)
+                                  + pd.offsets.MonthEnd(0) if p_.startswith("FY") else pd.Timestamp(int(p_), 12, 31)
+                                  for p_, t in zip(annual["period_label"], annual["ticker"])]
+            cur = annual[annual["year_end"] >= data_through]
+            lg = ((cur if not cur.empty else annual).sort_values(["filing_date", "year_end"], ascending=[False, True])
+                  .groupby("ticker").head(1).sort_values("value", ascending=False))
             show = pd.DataFrame({
                 "Company": lg["name"], "Period": lg["period_label"],
                 "Guidance": [fmt_range(l, h, v) for l, h, v in zip(lg["value_low"], lg["value_high"], lg["value"])],
@@ -341,8 +367,8 @@ with tabs[0]:
                 "Stated": lg["filing_date"].dt.strftime("%b %Y"), "url": lg["url"],
             })
             table(show, url=LINK)
-            source_note("Company press releases (8-K / 6-K). Revisions compare each statement with the previous one "
-                        "for the same period.")
+            source_note("Company press releases (8-K / 6-K) and earnings call transcripts. Revisions compare each "
+                        "statement with the previous one for the same period.")
 
     st.subheader("What's new")
     window = st.radio("Window", ["Last 7 days", "Last 30 days", "Last 90 days"], index=1, horizontal=True,
@@ -364,6 +390,63 @@ with tabs[0]:
                   Quote=st.column_config.TextColumn("Quote", width="large"))
             download(out.rename(columns={"url": "Source"}), "whats_new")
 
+def render_cloud():
+    """Signals > Cloud revenue: what the spending is earning."""
+    rev = A.cloud_revenue(facts[facts["ticker"].isin(sel_tickers)]) if not facts.empty else pd.DataFrame()
+    if rev.empty:
+        st.info("No cloud revenue for the current selection.")
+        return
+    gr = A.cloud_growth(facts[facts["ticker"].isin(sel_tickers)])
+    summ = A.cloud_summary(rev, gr, cq_all)
+    rev = rev.assign(name=rev["ticker"].map(NAME), group=rev["ticker"].map(GROUP))
+    # Only companies with both a full year of cloud revenue and capex, so the ratios compare like with like.
+    hs = summ[summ["ticker"].isin(hyp)].dropna(subset=["rev_4q", "rev_prev_4q", "capex_4q"])
+    r4, r4p = hs["rev_4q"].sum(min_count=1), hs["rev_prev_4q"].sum(min_count=1)
+    c4 = hs["capex_4q"].sum(min_count=1)
+    k = st.columns(3)
+    k[0].metric("Hyperscaler cloud revenue · last 4Q", money(r4),
+                f"{pct(r4 / r4p - 1)} vs prior 4 quarters" if r4 == r4 and r4p == r4p and r4p else None,
+                help="AWS, Google Cloud, Microsoft Cloud and Oracle Cloud Infrastructure (OCI), last four quarters. "
+                     "Meta has no cloud business.")
+    k[1].metric("Hyperscaler capex ÷ cloud revenue", f"{c4 / r4:.1f}×" if r4 == r4 and r4 and c4 == c4 else "—",
+                help="Capex over the last four quarters for the same companies, divided by their cloud revenue. "
+                     "Capex is company-wide, so this overstates what goes into cloud alone.")
+    k[2].metric("New cloud revenue per $1 of capex",
+                f"${(r4 - r4p) / hs['capex_4q'].sum():.2f}" if r4 == r4 and r4p == r4p and c4 == c4 and c4 else "—",
+                help="Growth in cloud revenue over the last four quarters, divided by capex over the same period: how "
+                     "much new annual revenue each dollar of current spending is matched by.")
+    group = st.radio("Companies", ["Hyperscalers", "Neoclouds"], horizontal=True, key="cloud_group",
+                     label_visibility="collapsed")
+    view = rev[rev["group"].eq("Hyperscaler")] if group == "Hyperscalers" else rev[~rev["group"].eq("Hyperscaler")]
+    if view.empty:
+        st.info(f"No cloud revenue for {group.lower()} in the current selection.")
+    else:
+        chart(alt.Chart(view).mark_line(point=True, strokeWidth=2).encode(
+            x=alt.X("end:T", title="Quarter ending"), y=alt.Y("value:Q", title="Quarterly revenue ($B)"),
+            color=alt.Color("name:N", scale=company_colors(view), title=None, legend=alt.Legend(orient="bottom", columns=5)),
+            tooltip=[alt.Tooltip("name:N", title="Company"), alt.Tooltip("segment:N", title="Business"),
+                     alt.Tooltip("end:T", title="Quarter ending"), alt.Tooltip("value:Q", title="Revenue $B", format=",.2f"),
+                     alt.Tooltip("quote:N", title="Quote")]), 320)
+    show = summ.assign(name=summ["ticker"].map(NAME), group=summ["ticker"].map(GROUP))
+    show = show.sort_values(["group", "rev_4q"], ascending=[True, False])
+    table(pd.DataFrame({
+        "Company": show["name"], "Business": show["segment"],
+        "Latest quarter": show["latest_end"].dt.strftime("%b %Y"), "Revenue": show["latest_b"].map(lambda v: money(v, 2)),
+        "vs year ago": show["yoy"].map(pct),
+        "Stated growth": [f"{g:.0f}% ({s_})" if g == g else "—" for g, s_ in
+                          zip(show["stated_growth_pct"], show["stated_growth_segment"])],
+        "Revenue · last 4Q": show["rev_4q"].map(money), "Capex · last 4Q": show["capex_4q"].map(money),
+        "Capex ÷ revenue": [f"{v:.1f}×" if v == v else "—" for v in show["capex_to_revenue"]],
+        "Source": show["url"]}), Source=LINK)
+    source_note("Earnings releases (8-K / 6-K), extracted by Claude and checked against the release text; capex "
+                "from SEC XBRL. Each company is tracked on one business line: AWS, Google Cloud, Microsoft "
+                "Cloud (includes commercial Microsoft 365 and Dynamics; Microsoft states growth for Azure only, shown "
+                "separately), Oracle Cloud Infrastructure (IaaS, excluding SaaS), total revenue for CoreWeave and "
+                "Nebius, and AI cloud revenue for IREN. Quarters are mapped to calendar dates on each company's own "
+                "fiscal calendar (Microsoft's Q1 FY2027 is the quarter ending September 2026). Capex is "
+                "company-wide, so capex ÷ revenue overstates cloud's share. 'Stated growth' is the company's own "
+                "rate, which can be in constant currency or for a narrower line (Azure within Microsoft Cloud).")
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
@@ -377,7 +460,12 @@ with tabs[1]:
 
     flows = A.lease_flows(data["xbrl_quarterly"], disc) if not disc.empty else pd.DataFrame()
     flows = flows[flows["ticker"].isin(sel_tickers)] if not flows.empty else flows
-    proj, params = A.lease_projection(flows) if not flows.empty else (pd.DataFrame(), pd.DataFrame())
+    annual = A.annual_lease_starts(data["xbrl_quarterly"], flows) if not flows.empty else pd.DataFrame()
+    windows = A.stated_windows(disc) if not disc.empty else pd.DataFrame()
+    tranches = (A.stated_tranches(disc, flows.groupby("ticker")["end"].max().to_dict()) if not flows.empty
+                else pd.DataFrame())
+    proj, params = (A.lease_projection(flows, annual=annual, windows=windows, tranches=tranches) if not flows.empty
+                    else (pd.DataFrame(), pd.DataFrame()))
     if not params.empty:  # only meaningful, current pipelines
         params = params[(params["pool"] >= 1) & (params["as_of"] >= data_through - pd.Timedelta(days=270))]
         proj = proj[proj["ticker"].isin(params["ticker"])]
@@ -394,12 +482,24 @@ with tabs[1]:
     ago = [pool_year_ago(t, e) for t, e in zip(hp["ticker"], hp["end"])] if len(hp) else []
     pool_then = sum(a for a in ago if a == a) if ago and all(a == a for a in ago) else np.nan
     last4 = flows.dropna(subset=["signed", "starts"]) if not flows.empty else flows
-    last4 = (last4[last4["ticker"].isin(params["ticker"]) & (last4["end"] > data_through - pd.Timedelta(days=380))]
+    last4 = (last4[last4["ticker"].isin(params["ticker"]) & last4["ticker"].isin(hyp)
+                   & (last4["end"] > data_through - pd.Timedelta(days=380))]
              if not params.empty else last4.iloc[0:0])
     signed_4q, starts_4q = (float(last4["signed"].sum()), float(last4["starts"].sum())) if len(last4) else (0.0, 0.0)
-    next4 = (proj[proj["from_disclosed_backlog"]].groupby("case")["starts"].sum()
-             if not proj.empty else pd.Series(dtype=float))
+    # Next four quarters per company: past pace and, where stated, the company's own timing.
+    n4 = (proj[proj["from_disclosed_backlog"] & (proj["case"] != "No new signings")]
+          .groupby(["ticker", "case"])["starts"].sum().unstack() if not proj.empty else pd.DataFrame())
+    n4h = n4[n4.index.isin(hyp)] if not n4.empty else n4
+    if not n4h.empty:
+        pace = n4h["Signings continue"]
+        told = n4h["Company's stated timing"] if "Company's stated timing" in n4h else pace * np.nan
+        next_lo, next_hi = float(np.fmin(pace, told).sum()), float(np.fmax(pace, told).sum())
+    else:
+        next_lo = next_hi = np.nan
 
+    no_q = [NAME[t] for t in hyp if t in set(flows["ticker"]) and t not in set(last4["ticker"])] \
+        if not flows.empty else []
+    note_q = f" Leaves out {', '.join(no_q)} (no quarterly lease-start data)." if no_q else ""
     capex_now, capex_prev = A.ttm_total(cq, hyp), A.ttm_total(cq, hyp, offset=4)
 
     # Headlines, generated from the numbers
@@ -411,7 +511,8 @@ with tabs[1]:
     if signed_4q:
         lines.append(f"In the last four quarters they signed an implied **{money(signed_4q)}** of new leases and "
                      f"**{money(starts_4q)}** started, so the backlog of signed leases is "
-                     f"{'growing' if signed_4q > starts_4q else 'shrinking'}.")
+                     f"{'growing' if signed_4q > starts_4q else 'shrinking'}"
+                     + (f" ({', '.join(no_q)} not included: no quarterly lease-start data)." if no_q else "."))
     if capex_now and capex_prev:
         lines.append(f"Hyperscaler capex over the last four quarters is **{money(capex_now)}**, "
                      f"**{pct(capex_now / capex_prev - 1)}** from the four quarters before.")
@@ -430,161 +531,281 @@ with tabs[1]:
                 help="Sum of each selected hyperscaler's latest figure (total future lease payments), from 10-Q and "
                      "10-K lease notes.")
     k[1].metric("New leases signed · last 4Q", money(signed_4q) if signed_4q else "—",
-                help="Implied: change in leases not yet started, plus leases that started. Companies do not report "
-                     "this directly. Total future payments.")
+                help="Hyperscalers. Implied: change in leases not yet started, plus leases that started. Companies do "
+                     "not report this directly. Total future payments." + note_q)
     k[2].metric("Leases started · last 4Q", money(starts_4q) if starts_4q else "—",
-                help="Leases that commenced (SEC XBRL right-of-use assets obtained), converted to total future "
-                     "payments so they compare with the figures beside them.")
-    if len(next4):
-        nxt = float(next4.iloc[0])
-        k[3].metric("Projected lease starts · next 4Q", money(nxt),
-                    f"{pct(nxt / starts_4q - 1)} vs last 4Q" if starts_4q else None,
-                    help="Projected from leases already signed a year earlier, so it does not depend on future "
-                         "signings. It assumes recent leases start as quickly as earlier ones did; very large campus "
-                         "leases may take longer to build. See the method below.")
+                help="Hyperscalers. Leases that commenced (SEC XBRL right-of-use assets obtained), converted to total "
+                     "future payments so they compare with the figures beside them." + note_q)
+    if next_hi == next_hi:
+        k[3].metric("Projected lease starts · next 4Q",
+                    money(next_hi) if abs(next_hi - next_lo) < 0.5 else f"{money(next_lo)}–{money(next_hi)}",
+                    help="Hyperscalers. From leases already signed, so it does not depend on future signings. The range runs from "
+                         "the company's own stated timing (Meta, Oracle) to the pace at which earlier leases started. "
+                         "See the method below.")
     else:
         k[3].metric("Projected lease starts · next 4Q", "—")
 
-    st.subheader("Lease pipeline: signed, started and projected")
-    if flows.empty or flows["signed"].notna().sum() == 0:
-        st.info("No lease pipeline data for the current selection.")
-    else:
-        opts = (flows.groupby("ticker")["pool"].last().sort_values(ascending=False).index.map(NAME).tolist())
-        who = st.selectbox("Company", opts, key="sig_company")
-        t = companies.loc[companies["name"] == who, "ticker"].iloc[0]
-        f = flows[flows["ticker"] == t].sort_values("end")
-        left, right = st.columns(2, gap="large")
-        with left:
-            st.markdown("**Signed and started each quarter** · total future payments, $B")
-            bars = f.dropna(subset=["signed"]).melt(id_vars=["end"], value_vars=["signed", "starts"], var_name="flow",
-                                                    value_name="value")
-            bars["flow"] = bars["flow"].map({"signed": "Signed (implied)", "starts": "Started"})
-            if bars.empty:
-                st.info("Needs two consecutive quarters of lease data.")
-            else:
-                chart(alt.Chart(bars).mark_bar().encode(
-                    x=alt.X("yearquarter(end):O", title=None, axis=alt.Axis(labelAngle=0, format="Q%q %y")),
-                    xOffset="flow:N",
+    sig = st.tabs(["Leases", "Cloud revenue", "Capacity", "Capex momentum", "Neocloud funding"])
+    with sig[0]:
+        st.markdown("#### Signed leases not yet started")
+        st.markdown(
+            "<div class='subtle'>Leases a company has signed as tenant, mostly data centers still under construction, "
+            "whose terms have not started yet. The amount is the total future lease payments. It shows capacity already "
+            "committed that is not yet in capex or on the balance sheet.</div>", unsafe_allow_html=True)
+        lser = A.lease_series(disc) if not disc.empty else pd.DataFrame()
+        if lser.empty:
+            st.info("No lease commitments for the current selection.")
+        else:
+            lc1, lc2 = st.columns([3, 2], gap="large")
+            with lc1:
+                chart(alt.Chart(lser).mark_line(point=True, strokeWidth=2).encode(
+                    x=alt.X("as_of:T", title="As of"),
                     y=alt.Y("value:Q", title="$B"),
-                    color=alt.Color("flow:N", title=None, scale=alt.Scale(domain=["Signed (implied)", "Started"],
-                                                                          range=["#1f5f8b", "#e07b39"]),
-                                    legend=alt.Legend(orient="top")),
-                    tooltip=[alt.Tooltip("end:T", title="Quarter ending"), alt.Tooltip("flow:N", title="Flow"),
-                             alt.Tooltip("value:Q", title="$B", format=",.1f")]), 320)
-        with right:
-            st.markdown("**Lease starts, actual and projected** · total future payments, $B")
-            hist = f.dropna(subset=["starts"])[["end", "starts"]].assign(case="Actual")
-            pj = proj[proj["ticker"] == t][["end", "starts", "case"]] if not proj.empty else pd.DataFrame()
-            if pj.empty:
-                st.info(f"Not enough recent quarters of lease starts to project {who}.")
+                    color=alt.Color("name:N", scale=company_colors(lser), title=None, legend=alt.Legend(orient="bottom", columns=5)),
+                    tooltip=[alt.Tooltip("name:N", title="Company"), alt.Tooltip("display_value:N", title="Value"),
+                             alt.Tooltip("period:N", title="As of"), alt.Tooltip("first_stated:T", title="Stated"),
+                             alt.Tooltip("quote:N", title="Quote")]), 320)
+            with lc2:
+                ll = lser.sort_values("as_of").groupby("ticker").tail(1).sort_values("value", ascending=False)
+                lt = pd.DataFrame({"Company": ll["name"], "Latest": ll["display_value"],
+                                   "As of": ll["as_of"].dt.strftime("%b %d, %Y"), "Source": ll["url"]})
+                table(lt, Source=LINK)
+                download(lt, "leases_not_commenced")
+            source_note("10-Q and 10-K lease notes, extracted by Claude and checked against the filing text. Only totals "
+                        "stated as of a date are plotted (not individual leases signed after it). Where a filing gives "
+                        "operating and finance leases separately (Microsoft before 2025, Meta 2023), the two are added. "
+                        "Company wording differs, so check the quote.")
+
+        st.markdown("#### Signed, started and projected, by company")
+        if flows.empty or flows["signed"].notna().sum() == 0:
+            st.info("No lease pipeline data for the current selection.")
+        else:
+            opts = (flows.groupby("ticker")["pool"].last().sort_values(ascending=False).index.map(NAME).tolist())
+            who = st.selectbox("Company", opts, key="sig_company")
+            t = companies.loc[companies["name"] == who, "ticker"].iloc[0]
+            f = flows[flows["ticker"] == t].sort_values("end")
+            left, right = st.columns(2, gap="large")
+            with left:
+                st.markdown("**Signed and started each quarter** · total future payments, $B")
+                bars = f.dropna(subset=["signed"]).melt(id_vars=["end"], value_vars=["signed", "starts"], var_name="flow",
+                                                        value_name="value")
+                bars["flow"] = bars["flow"].map({"signed": "Signed (implied)", "starts": "Started"})
+                if bars.empty:
+                    st.info("Needs two consecutive quarters of lease data.")
+                else:
+                    chart(alt.Chart(bars).mark_bar().encode(
+                        x=alt.X("yearquarter(end):O", title=None, axis=alt.Axis(labelAngle=0, format="Q%q %y")),
+                        xOffset="flow:N",
+                        y=alt.Y("value:Q", title="$B"),
+                        color=alt.Color("flow:N", title=None, scale=alt.Scale(domain=["Signed (implied)", "Started"],
+                                                                              range=["#1f5f8b", "#e07b39"]),
+                                        legend=alt.Legend(orient="top")),
+                        tooltip=[alt.Tooltip("end:T", title="Quarter ending"), alt.Tooltip("flow:N", title="Flow"),
+                                 alt.Tooltip("value:Q", title="$B", format=",.1f")]), 320)
+            with right:
+                st.markdown("**Lease starts, actual and projected** · total future payments, $B")
+                hist = f.dropna(subset=["starts"])[["end", "starts", "starts_basis"]].copy()
+                hist["case"] = np.where(hist["starts_basis"] == "estimated", "Estimated from lease assets", "Actual")
+                hist = hist.drop(columns="starts_basis")
+                if not annual.empty and t in set(annual["ticker"]):  # years reported only as a full-year total
+                    have = set(pd.to_datetime(hist["end"]).dt.year)
+                    fy = annual[(annual["ticker"] == t) & (annual["end"] >= pd.Timestamp("2023-01-01"))]
+                    extra = [{"end": e - pd.offsets.MonthEnd(3 * i), "starts": a / 4, "case": "Actual (full year ÷ 4)"}
+                             for e, a in zip(fy["end"], fy["starts"]) if e.year not in have for i in range(3, -1, -1)]
+                    if extra:
+                        hist = pd.concat([hist, pd.DataFrame(extra)])
+                pj = proj[proj["ticker"] == t][["end", "starts", "case"]] if not proj.empty else pd.DataFrame()
+                if pj.empty:
+                    st.info(f"Not enough recent quarters of lease starts to project {who}.")
+                else:
+                    lastpt = hist.sort_values("end").iloc[-1] if not hist.empty else None
+                    first_proj = pd.to_datetime(pj["end"]).min()
+                    if lastpt is not None and (first_proj - pd.Timestamp(lastpt["end"])).days <= 100:
+                        # join the projection lines to the last actual quarter (not across a gap in the data)
+                        pj = pd.concat([pd.DataFrame({"end": [lastpt["end"]] * 2, "starts": [lastpt["starts"]] * 2,
+                                                      "case": ["Signings continue", "No new signings"]}), pj])
+                    pj["end"] = pd.to_datetime(pj["end"]).astype("datetime64[ns]")
+                    hist["end"] = pd.to_datetime(hist["end"]).astype("datetime64[ns]")
+                    band = pj.pivot_table(index="end", columns="case", values="starts").reset_index()
+                    dom = ["Actual", "Estimated from lease assets", "Actual (full year ÷ 4)", "Signings continue",
+                           "No new signings", "Company's stated timing"]
+                    rng = ["#1f2933", "#52606d", "#7a8794", "#1f5f8b", "#a9b9c9", "#c2571a"]
+                    present = set(hist["case"]) | set(pj["case"])
+                    dom, rng = [d for d in dom if d in present], [r for d, r in zip(dom, rng) if d in present]
+                    lines_ = alt.Chart(pd.concat([hist, pj])).mark_line(point=True, strokeWidth=2).encode(
+                        x=alt.X("end:T", title=None), y=alt.Y("starts:Q", title="$B"),
+                        color=alt.Color("case:N", title=None, scale=alt.Scale(domain=dom, range=rng),
+                                        legend=alt.Legend(orient="bottom", columns=3, labelLimit=220)),
+                        strokeDash=alt.condition(alt.FieldOneOfPredicate(field="case", oneOf=["Actual", "Estimated from lease assets", "Actual (full year ÷ 4)"]),
+                                                 alt.value([1, 0]), alt.value([5, 4])),
+                        order=alt.Order("end:T"),
+                        tooltip=[alt.Tooltip("end:T", title="Quarter ending"), alt.Tooltip("case:N", title="Series"),
+                                 alt.Tooltip("starts:Q", title="$B", format=",.1f")])
+                    area = alt.Chart(band).mark_area(opacity=0.12, color="#1f5f8b").encode(
+                        x="end:T", y="No new signings:Q", y2="Signings continue:Q")
+                    chart(area + lines_, 320)
+
+            if not params.empty:
+                pa = params.assign(name=params["ticker"].map(NAME)).sort_values("pool", ascending=False)
+                yr2 = proj[~proj["from_disclosed_backlog"] & (proj["case"] != "Company's stated timing")].groupby(
+                    ["ticker", "case"])["starts"].sum().unstack().add_suffix("_yr2")
+                pa = pa.join(n4, on="ticker").join(yr2, on="ticker")
+                told_col = pa["Company's stated timing"] if "Company's stated timing" in pa else pd.Series(np.nan, index=pa.index)
+
+                def window_label(r):
+                    if r["window_end"] != r["window_end"]:
+                        return "—"
+                    return f"{max(r['window_start'], r['as_of']):%b %Y} – {r['window_end']:%b %Y}"
+                table(pd.DataFrame({
+                    "Company": pa["name"], "Signed, not started": pa["pool"].map(money),
+                    "As of": pa["as_of"].dt.strftime("%b %d, %Y"),
+                    "Started · last 4Q": [money(v) + (" (FY)" if b == "annual" else "") for v, b in
+                                          zip(pa["starts_4q"], pa["basis"])],
+                    "Years of backlog at that pace": pa["years_of_backlog"].map(lambda y: "—" if y != y else f"{y:.1f}"),
+                    "Next 4Q · past pace": pa["Signings continue"].map(money),
+                    "Next 4Q · company's timing": told_col.map(money),
+                    "Company's stated window": pa.apply(window_label, axis=1),
+                    "4Q after · past pace": [f"{money(a)}–{money(b)}" for a, b in
+                                             zip(pa["No new signings_yr2"], pa["Signings continue_yr2"])],
+                }))
+            bt = A.lease_backtest(flows, annual)
+            bt = bt[bt["ticker"].isin(params["ticker"])] if not params.empty else bt.iloc[0:0]
+            if not bt.empty:
+                st.markdown("**Track record** · the same model refit on data up to a year earlier, against the lease "
+                            "starts that followed")
+                table(pd.DataFrame({
+                    "Company": bt["ticker"].map(NAME), "Data up to": bt["cutoff"].dt.strftime("%b %Y"),
+                    "Predicted · next 4Q": bt["predicted"].map(money), "Actual": bt["actual"].map(money),
+                    "Error": bt["error"].map(pct),
+                    "Note": ["Actual quarters estimated from lease assets" if n else "" for n in bt["estimated_quarters"]],
+                }))
+            source_note(
+                "All figures are total future lease payments. Signed, not started: 10-Q / 10-K lease notes (operating "
+                "and finance parts added where given separately). Started: SEC XBRL right-of-use assets obtained for "
+                "new leases, a present value, converted to total payments with each company's ratio of lease payments "
+                "due to lease liability (1.2× to 1.8×). Signed (implied) = change in signed-not-started + started. "
+                "Projection: leases start when construction finishes, so each quarter's starts are modeled as a fixed "
+                "share of the backlog four quarters earlier, with the share fitted on the company's last four quarters. "
+                "The next four quarters therefore follow from backlog already disclosed. The four after that need the "
+                "backlog itself projected: the range runs from no new signings to signings continuing at their recent "
+                "average. Meta reports lease starts only as a full-year total from 2025; its quarters are estimated from "
+                "its quarterly lease-asset balances (change in the asset plus amortization, calibrated so 2025 adds up to "
+                "the reported total). Company's timing: where a company states when its backlog will commence (Meta: 2026 to "
+                "2036; Oracle: fiscal 2027 to 2029), the backlog already signed is spread evenly over that window. The "
+                "past-pace figure assumes recent leases start as quickly as earlier ones; very large campuses can take "
+                "longer, so where both exist, read them as a range. Started leases include all leases, not only data "
+                "centers.")
+
+    with sig[1]:
+        render_cloud()
+
+    with sig[2]:
+        if others:
+            cap = A.capacity_schedule(facts[facts["ticker"].isin(others)], data_through)
+            if cap.empty:
+                st.info("No dated capacity plans for the current selection.")
             else:
-                if not hist.empty:  # join the projection lines to the last actual point
-                    pj = pd.concat([pd.DataFrame({"end": [hist["end"].iloc[-1]] * 2,
-                                                  "starts": [hist["starts"].iloc[-1]] * 2,
-                                                  "case": ["Signings continue", "No new signings"]}), pj])
-                pj["end"] = pd.to_datetime(pj["end"]).astype("datetime64[ns]")
-                hist["end"] = pd.to_datetime(hist["end"]).astype("datetime64[ns]")
-                band = pj.pivot_table(index="end", columns="case", values="starts").reset_index()
-                dom, rng = ["Actual", "Signings continue", "No new signings"], ["#1f2933", "#1f5f8b", "#7a8794"]
-                lines_ = alt.Chart(pd.concat([hist, pj])).mark_line(point=True, strokeWidth=2).encode(
-                    x=alt.X("end:T", title=None), y=alt.Y("starts:Q", title="$B"),
-                    color=alt.Color("case:N", title=None, scale=alt.Scale(domain=dom, range=rng),
-                                    legend=alt.Legend(orient="top")),
-                    strokeDash=alt.condition(alt.datum.case == "Actual", alt.value([1, 0]), alt.value([5, 4])),
-                    order=alt.Order("end:T"),
-                    tooltip=[alt.Tooltip("end:T", title="Quarter ending"), alt.Tooltip("case:N", title="Series"),
-                             alt.Tooltip("starts:Q", title="$B", format=",.1f")])
-                area = alt.Chart(band).mark_area(opacity=0.12, color="#1f5f8b").encode(
-                    x="end:T", y="No new signings:Q", y2="Signings continue:Q")
-                chart(area + lines_, 320)
-
-        if not params.empty:
-            pa = params.assign(name=params["ticker"].map(NAME)).sort_values("pool", ascending=False)
-            yr1 = proj[proj["from_disclosed_backlog"] & (proj["case"] == "Signings continue")].groupby("ticker")["starts"].sum()
-            yr2 = proj[~proj["from_disclosed_backlog"]].groupby(["ticker", "case"])["starts"].sum().unstack()
-            pa = pa.assign(yr1=pa["ticker"].map(yr1)).join(yr2, on="ticker")
-            table(pd.DataFrame({
-                "Company": pa["name"], "Signed, not started": pa["pool"].map(money),
-                "As of": pa["as_of"].dt.strftime("%b %d, %Y"),
-                "Started · last 4Q": pa["starts_4q"].map(money),
-                "Years of backlog at that pace": pa["years_of_backlog"].map(lambda y: "—" if y != y else f"{y:.1f}"),
-                "Signed per quarter (avg)": pa["signed_avg"].map(money),
-                "Projected starts · next 4Q": pa["yr1"].map(money),
-                "Projected starts · 4Q after": [f"{money(a)}–{money(b)}" for a, b in
-                                                zip(pa["No new signings"], pa["Signings continue"])],
-            }))
-        source_note(
-            "All figures are total future lease payments. Signed, not started: 10-Q / 10-K lease notes (operating "
-            "and finance parts added where given separately). Started: SEC XBRL right-of-use assets obtained for "
-            "new leases, a present value, converted to total payments with each company's ratio of lease payments "
-            "due to lease liability (1.2× to 1.8×). Signed (implied) = change in signed-not-started + started. "
-            "Projection: leases start when construction finishes, so each quarter's starts are modeled as a fixed "
-            "share of the backlog four quarters earlier, with the share fitted on the company's last four quarters. "
-            "The next four quarters therefore follow from backlog already disclosed. The four after that need the "
-            "backlog itself projected: the range runs from no new signings to signings continuing at their recent "
-            "average. Started leases include all leases, not only data centers. Meta stopped tagging quarterly lease "
-            "starts after 2024, so it has no projection. Read the projection as a scale, not a schedule: it "
-            "assumes recently signed leases start as quickly as earlier ones did, while multi-gigawatt campuses may "
-            "take longer (Oracle, for example, says its backlog starts over roughly the next three years).")
-
-    st.subheader("Capex momentum")
-    if cq.empty:
-        st.info("No capex data for the current selection.")
-    else:
-        rows = []
-        for t, g in cq.sort_values("end").groupby("ticker"):
-            v = dict(zip(g["quarter"], g["value_usd_billion"]))
-            qs = sorted(v, key=A._qnum)
-            if len(qs) < 6:
-                continue
-            def yoy(q):
-                prev = [p for p in qs if A._qnum(p) == A._qnum(q) - 4]
-                return v[q] / v[prev[0]] - 1 if prev and v[prev[0]] > 0 else np.nan
-            y0, y1 = yoy(qs[-1]), yoy(qs[-2])
-            rows.append({"ticker": t, "latest": qs[-1], "yoy": y0, "prev_yoy": y1,
-                         "trend": "—" if y0 != y0 or y1 != y1 else ("▲ Accelerating" if y0 > y1 else "▼ Slowing")})
-        mom = pd.DataFrame(rows)
-        if mom.empty:
-            st.info("Not enough quarters of capex for the current selection.")
+                cap["name"] = cap["ticker"].map(NAME)
+                horizon = cap[cap["expected_end"] <= data_through + pd.DateOffset(years=3)]
+                nxt = cap[cap["expected_end"] <= data_through + pd.DateOffset(years=1)]["mw"].sum()
+                after = cap[(cap["expected_end"] > data_through + pd.DateOffset(years=1))
+                            & (cap["expected_end"] <= data_through + pd.DateOffset(years=2))]["mw"].sum()
+                slipped = cap[cap["slip_days"] > 45]
+                k = st.columns(3)
+                k[0].metric("Expected online · next 12 months", f"{nxt:,.0f} MW",
+                            help="Sum of the capacity each company says will come online by a date within a year, from its "
+                                 "latest statement per site.")
+                k[1].metric("Expected online · the 12 months after", f"{after:,.0f} MW")
+                k[2].metric("Sites whose date has slipped", f"{len(slipped)}",
+                            help="Same site and MW, with an expected date more than 45 days later than first stated.")
+                if not horizon.empty:
+                    chart(alt.Chart(horizon).mark_bar().encode(
+                        x=alt.X("yearquarter(expected_end):O", title="Expected by", axis=alt.Axis(labelAngle=0, format="Q%q %y")),
+                        y=alt.Y("sum(mw):Q", title="MW"),
+                        color=alt.Color("name:N", scale=company_colors(horizon), title=None,
+                                        legend=alt.Legend(orient="bottom", columns=5)),
+                        tooltip=[alt.Tooltip("name:N", title="Company"), alt.Tooltip("site:N", title="Site"),
+                                 alt.Tooltip("mw:Q", title="MW", format=",.0f"),
+                                 alt.Tooltip("expected_text:N", title="Company's words"),
+                                 alt.Tooltip("stated:T", title="Stated"), alt.Tooltip("quote:N", title="Quote")]), 300)
+                out = pd.DataFrame({
+                    "Company": cap["name"], "Site": cap["site"].fillna("Company total"),
+                    "MW": cap["mw"].map(lambda v: f"{v:,.0f}"), "Expected": cap["expected_text"],
+                    "Stated": cap["stated"].dt.strftime("%b %d, %Y"),
+                    "Change since first stated": [f"{d / 30.4:+.0f} months" if d == d and abs(d) > 45 else ""
+                                                  for d in cap["slip_days"]],
+                    "Quote": cap["quote"], "url": cap["url"]})
+                with st.expander(f"All {len(out)} dated capacity plans"):
+                    table(out, height=380, url=LINK, Quote=st.column_config.TextColumn(width="large"))
+                    download(out.rename(columns={"url": "Source"}), "capacity_plans")
+                source_note("Press releases, shareholder letters and filings, extracted by Claude with the date each "
+                            "company gives for capacity coming online. The latest statement per site is used; "
+                            "'Expected by' is the end of the stated period (e.g. 'H1 2027' counts as June 2027). Includes "
+                            "contracted and pipeline capacity, so it is what companies say, not what will be built.")
         else:
-            summ = A.capex_summary(cq).set_index("ticker")
-            mom = mom.join(summ[["ttm_b", "ttm_yoy"]], on="ticker").sort_values("ttm_b", ascending=False)
-            table(pd.DataFrame({
-                "Company": mom["ticker"].map(NAME), "Type": mom["ticker"].map(GROUP),
-                "Capex · last 4Q": mom["ttm_b"].map(money), "vs prior 4Q": mom["ttm_yoy"].map(pct),
-                "Latest quarter": mom["latest"].str.replace("Q", " Q"), "Latest vs year ago": mom["yoy"].map(pct),
-                "Prior quarter vs year ago": mom["prev_yoy"].map(pct), "Trend": mom["trend"]}))
-            source_note("SEC XBRL quarterly capex. Trend compares the latest quarter's year-over-year growth with the "
-                        "previous quarter's.")
+            st.info("Select a neocloud or AI infrastructure company to see this.")
 
-    if others:
-        st.subheader("Neocloud and AI infrastructure funding")
-        summ = A.capex_summary(cq[cq["ticker"].isin(others)]).set_index("ticker") if not cq.empty else pd.DataFrame()
-        bl = A.latest_values(disc[disc["ticker"].isin(others)], ["backlog_usd"]).set_index("ticker") \
-            if not disc.empty else pd.DataFrame()
-        o4 = ocf[ocf["ticker"].isin(others)].sort_values("end").groupby("ticker").tail(4).groupby("ticker").agg(
-            ocf_4q=("value_usd_billion", "sum"), n=("value_usd_billion", "size"))
-        fund = pd.DataFrame({"ticker": [t for t in others if (t in summ.index) or (t in bl.index)]})
-        if fund.empty:
-            st.info("No data for the current selection.")
+    with sig[3]:
+        if cq.empty:
+            st.info("No capex data for the current selection.")
         else:
-            fund["capex"] = fund["ticker"].map(summ["ttm_b"]) if not summ.empty else np.nan
-            fund["backlog"] = fund["ticker"].map(bl["value"]) if not bl.empty else np.nan
-            fund["ocf"] = fund["ticker"].map(o4[o4["n"] == 4]["ocf_4q"])
-            fund = fund.sort_values("backlog", ascending=False)
-            table(pd.DataFrame({
-                "Company": fund["ticker"].map(NAME), "Revenue backlog": fund["backlog"].map(money),
-                "Capex · last 4Q": fund["capex"].map(money),
-                "Backlog ÷ capex": [f"{b / c:.1f}×" if b == b and c == c and c > 0 else "—"
-                                    for b, c in zip(fund["backlog"], fund["capex"])],
-                "Operating cash flow · last 4Q": fund["ocf"].map(money),
-                "Capex funded by operations": ["None (cash flow negative)" if o == o and o <= 0 else
-                                               pct(o / c, False) if o == o and c == c and c > 0 else "—"
-                                               for o, c in zip(fund["ocf"], fund["capex"])]}))
-            source_note("Backlog: latest figure from filings. Capex and operating cash flow: SEC XBRL, last four "
-                        "quarters. Backlog ÷ capex shows how much contracted revenue stands behind each dollar of "
-                        "recent spending; capex funded by operations is operating cash flow ÷ capex (the rest comes "
-                        "from debt, equity or cash on hand).")
+            rows = []
+            for t, g in cq.sort_values("end").groupby("ticker"):
+                v = dict(zip(g["quarter"], g["value_usd_billion"]))
+                qs = sorted(v, key=A._qnum)
+                if len(qs) < 6:
+                    continue
+                def yoy(q):
+                    prev = [p for p in qs if A._qnum(p) == A._qnum(q) - 4]
+                    return v[q] / v[prev[0]] - 1 if prev and v[prev[0]] > 0 else np.nan
+                y0, y1 = yoy(qs[-1]), yoy(qs[-2])
+                rows.append({"ticker": t, "latest": qs[-1], "yoy": y0, "prev_yoy": y1,
+                             "trend": "—" if y0 != y0 or y1 != y1 else ("▲ Accelerating" if y0 > y1 else "▼ Slowing")})
+            mom = pd.DataFrame(rows)
+            if mom.empty:
+                st.info("Not enough quarters of capex for the current selection.")
+            else:
+                summ = A.capex_summary(cq).set_index("ticker")
+                mom = mom.join(summ[["ttm_b", "ttm_yoy"]], on="ticker").sort_values("ttm_b", ascending=False)
+                table(pd.DataFrame({
+                    "Company": mom["ticker"].map(NAME), "Type": mom["ticker"].map(GROUP),
+                    "Capex · last 4Q": mom["ttm_b"].map(money), "vs prior 4Q": mom["ttm_yoy"].map(pct),
+                    "Latest quarter": mom["latest"].str.replace("Q", " Q"), "Latest vs year ago": mom["yoy"].map(pct),
+                    "Prior quarter vs year ago": mom["prev_yoy"].map(pct), "Trend": mom["trend"]}))
+                source_note("SEC XBRL quarterly capex. Trend compares the latest quarter's year-over-year growth with the "
+                            "previous quarter's.")
+
+    with sig[4]:
+        if others:
+            summ = A.capex_summary(cq[cq["ticker"].isin(others)]).set_index("ticker") if not cq.empty else pd.DataFrame()
+            bl = A.latest_values(disc[disc["ticker"].isin(others)], ["backlog_usd"]).set_index("ticker") \
+                if not disc.empty else pd.DataFrame()
+            o4 = ocf[ocf["ticker"].isin(others)].sort_values("end").groupby("ticker").tail(4).groupby("ticker").agg(
+                ocf_4q=("value_usd_billion", "sum"), n=("value_usd_billion", "size"))
+            fund = pd.DataFrame({"ticker": [t for t in others if (t in summ.index) or (t in bl.index)]})
+            if fund.empty:
+                st.info("No data for the current selection.")
+            else:
+                fund["capex"] = fund["ticker"].map(summ["ttm_b"]) if not summ.empty else np.nan
+                fund["backlog"] = fund["ticker"].map(bl["value"]) if not bl.empty else np.nan
+                fund["ocf"] = fund["ticker"].map(o4[o4["n"] == 4]["ocf_4q"])
+                fund = fund.sort_values("backlog", ascending=False)
+                table(pd.DataFrame({
+                    "Company": fund["ticker"].map(NAME), "Revenue backlog": fund["backlog"].map(money),
+                    "Capex · last 4Q": fund["capex"].map(money),
+                    "Backlog ÷ capex": [f"{b / c:.1f}×" if b == b and c == c and c > 0 else "—"
+                                        for b, c in zip(fund["backlog"], fund["capex"])],
+                    "Operating cash flow · last 4Q": fund["ocf"].map(money),
+                    "Capex funded by operations": ["None (cash flow negative)" if o == o and o <= 0 else
+                                                   pct(o / c, False) if o == o and c == c and c > 0 else "—"
+                                                   for o, c in zip(fund["ocf"], fund["capex"])]}))
+                source_note("Backlog: latest figure from filings. Capex and operating cash flow: SEC XBRL, last four "
+                            "quarters. Backlog ÷ capex shows how much contracted revenue stands behind each dollar of "
+                            "recent spending; capex funded by operations is operating cash flow ÷ capex (the rest comes "
+                            "from debt, equity or cash on hand).")
+        else:
+            st.info("Select a neocloud or AI infrastructure company to see this.")
+
 
 # ---------------------------------------------------------------------------
 # Capex
@@ -673,34 +894,6 @@ with tabs[2]:
             source_note("SEC XBRL. The dashed line is 100%: above it, capex exceeds the cash the business generates. "
                         "Quarters with negative trailing operating cash flow are omitted.")
 
-    st.subheader("Signed leases not yet commenced")
-    st.markdown(
-        "<div class='subtle'>Leases a company has signed as tenant, mostly data centers still under construction, "
-        "whose terms have not started yet. The amount is the total future lease payments. It shows capacity already "
-        "committed that is not yet in capex or on the balance sheet.</div>", unsafe_allow_html=True)
-    lser = A.lease_series(disc) if not disc.empty else pd.DataFrame()
-    if lser.empty:
-        st.info("No lease commitments for the current selection.")
-    else:
-        lc1, lc2 = st.columns([3, 2], gap="large")
-        with lc1:
-            chart(alt.Chart(lser).mark_line(point=True, strokeWidth=2).encode(
-                x=alt.X("as_of:T", title="As of"),
-                y=alt.Y("value:Q", title="$B"),
-                color=alt.Color("name:N", scale=company_colors(lser), title=None, legend=alt.Legend(orient="bottom", columns=5)),
-                tooltip=[alt.Tooltip("name:N", title="Company"), alt.Tooltip("display_value:N", title="Value"),
-                         alt.Tooltip("period:N", title="As of"), alt.Tooltip("first_stated:T", title="Stated"),
-                         alt.Tooltip("quote:N", title="Quote")]), 320)
-        with lc2:
-            ll = lser.sort_values("as_of").groupby("ticker").tail(1).sort_values("value", ascending=False)
-            lt = pd.DataFrame({"Company": ll["name"], "Latest": ll["display_value"],
-                               "As of": ll["as_of"].dt.strftime("%b %d, %Y"), "Source": ll["url"]})
-            table(lt, Source=LINK)
-            download(lt, "leases_not_commenced")
-        source_note("10-Q and 10-K lease notes, extracted by Claude and checked against the filing text. Only totals "
-                    "stated as of a date are plotted (not individual leases signed after it). Where a filing gives "
-                    "operating and finance leases separately (Microsoft before 2025, Meta 2023), the larger is shown. "
-                    "Company wording differs, so check the quote.")
 
 # ---------------------------------------------------------------------------
 # Guidance
@@ -713,10 +906,12 @@ with tabs[3]:
     else:
         c1, c2 = st.columns([3, 2])
         periods = sorted(gh["period_label"].unique(), key=A.period_sort_key, reverse=True)
-        default = [p for p in periods if p.isdigit() and int(p) >= data_through.year - 1] or periods[:2]
+        default = [p for p in periods if re.fullmatch(r"(?:FY)?\d{4}", p) and int(p[-4:]) >= data_through.year - 1] \
+            or periods[:2]
         sel_p = c1.multiselect("Guidance period", periods, default=default, key="g_periods",
-                               help="Fiscal and calendar years share a label; each company guides on one basis. "
-                                    "Quarterly (Q) and half-year (H) guidance is listed separately.")
+                               help="FY marks a fiscal year that does not end in December (Microsoft, Oracle, IREN, "
+                                    "Applied Digital); plain years are calendar years. Quarterly (Q) and half-year (H) "
+                                    "guidance is listed separately.")
         tiers = [x for x in ("Hyperscalers", "Neoclouds & AI infrastructure")
                  if (gh["ticker"].map(GROUP).eq("Hyperscaler") if x == "Hyperscalers"
                      else gh["ticker"].map(GROUP).ne("Hyperscaler")).any()]
@@ -758,14 +953,17 @@ with tabs[3]:
             "Revision": log_df["revision"].map(REVISION_LABEL),
             "Change": [("" if b != b else "No change" if abs(b) < 1e-9 else f"{'+' if b >= 0 else '−'}{money(abs(b))} ({pct(p_)})")
                        for b, p_ in zip(log_df["change_b"], log_df["change_pct"])],
-            "Company's wording": log_df["company_wording"].fillna(""), "Quote": log_df["quote"], "url": log_df["url"],
+            "Check": ["⚠ " + c_ if c_ else "" for c_ in log_df["check"]] if "check" in log_df else "",
+            "Quote": log_df["quote"], "url": log_df["url"],
         })
         table(out, url=LINK, Quote=st.column_config.TextColumn(width="large"))
         download(out.rename(columns={"url": "Source"}), "capex_guidance")
-        source_note("Capex guidance stated in 8-K and 6-K press releases, extracted by Claude and checked against the "
-                    "filing text. Revision is computed from the numbers, not taken from the company's wording. "
+        source_note("Capex guidance stated in 8-K and 6-K press releases and on earnings calls (where transcripts are "
+                    "loaded), extracted by Claude and checked against the source text. Revision is computed from the numbers, not taken from the company's wording. "
                     "Open-ended statements ('over the next several years', project-level budgets) are listed under "
-                    "All disclosures instead. Guidance given only on earnings calls is not captured.")
+                    "Explore data instead. 'Check' marks statements the automatic consistency checks question "
+                    "(e.g. a figure that may be an increment or a partial year); they are left out of the Overview's "
+                    "revision count.")
 
 # ---------------------------------------------------------------------------
 # Power & capacity
@@ -1064,14 +1262,15 @@ with tabs[8]:
             """
 **1. Collect.** Every relevant filing since January 2024 by the tracked companies is downloaded from
 SEC EDGAR: earnings releases, deal announcements and financings (8-K and 6-K), and quarterly and annual
-reports (10-Q, 10-K and 20-F) for lease commitments, capacity and backlog. Contracts and financings are taken
+reports (10-Q, 10-K and 20-F) for lease commitments, capacity and backlog. Earnings call transcripts
+since late 2024 are read for every company (executives' remarks only). Contracts and financings are taken
 from announcements only, because quarterly reports restate older deals.
 
 **2. Quarterly capex (no AI involved).** Capital expenditures and operating cash flow come from the
 SEC's XBRL financial data, the tagged numbers in each 10-Q and 10-K. Year-to-date figures are differenced
 into single quarters. Nebius files annual XBRL only, so its quarterly capex comes from its press releases.
 
-**3. Extraction.** Paragraphs that mention capex, power, GPUs, backlog, leases, contracts or financing are sent to
+**3. Extraction.** Paragraphs that mention capex, power, GPUs, backlog, leases, cloud revenue, contracts or financing are sent to
 Claude (Anthropic), which records each fact in a fixed format and must copy the sentence it came from,
 word for word.
 
@@ -1093,6 +1292,10 @@ documents that repeat it.
 **6. Guidance revisions.** Each capex guidance statement is compared with the same company's previous
 statement for the same period: raised, lowered or maintained. This is computed from the numbers, not taken
 from the company's wording.
+
+**7. Consistency checks.** Rules compare outputs with each other (guidance with reported capex, lease
+backlog quarter to quarter, cloud revenue with stated growth). Findings are listed under Automatic checks
+below; questioned guidance statements are not counted as revisions until confirmed.
             """
         )
     with b:
@@ -1104,13 +1307,36 @@ from the company's wording.
         st.markdown("**Known limitations**")
         st.markdown(
             """
-- **Earnings calls are not covered.** Much capex guidance (Microsoft especially) is given only on calls,
-  which are not SEC filings.
+- **Earnings calls start in late 2024.** Guidance given only on earlier calls is missing.
+- **Fiscal years differ.** Microsoft, Oracle, Applied Digital and IREN do not end their year in December;
+  their periods are labelled FY (Microsoft's FY2027 runs July 2026 to June 2027) and mapped to calendar
+  quarters on charts. A plain year such as "2026" is always a calendar year.
 - **Definitions differ by company.** "Contracted MW" may be gross or critical IT load; backlog for
   hyperscalers is company-wide RPO, not AI-only.
 - **Filing lag.** Companies report quarterly; the latest quarter appears 3 to 6 weeks after it ends.
             """
         )
+
+    st.subheader("Automatic checks")
+    st.markdown("<div class='subtle'>Rules that look across the outputs for numbers that contradict each other or "
+                "could mislead: guidance below spend already reported, a figure that is an increment or a partial year, "
+                "a lease backlog that halves, more active than contracted power, cloud revenue that disagrees with the "
+                "stated growth. Findings are for a person to confirm; confirmed errors go in the excluded figures list "
+                "below.</div>", unsafe_allow_html=True)
+    if issues.empty:
+        st.success("No findings for the current selection.")
+    else:
+        cnt = issues["severity"].value_counts()
+        q = st.columns(3)
+        for col, sev, txt in ((q[0], "High", "Contradictions"), (q[1], "Medium", "To review"), (q[2], "Low", "Notes")):
+            col.metric(f"{sev} · {txt}", int(cnt.get(sev, 0)))
+        sev_pick = st.segmented_control("Show", ["High", "Medium", "Low"], selection_mode="multi",
+                                        default=["High", "Medium"], key="chk_sev")
+        iv = issues[issues["severity"].isin(sev_pick or [])]
+        table(pd.DataFrame({"Severity": iv["severity"], "Area": iv["area"], "Company": iv["ticker"].map(NAME),
+                            "Finding": iv["finding"], "Detail": iv["detail"],
+                            "Date": iv["date"].dt.strftime("%b %d, %Y"), "url": iv["url"]}),
+              url=LINK, Detail=st.column_config.TextColumn(width="large"))
 
     st.subheader("Data quality")
     s = scores(facts_all, data["reviews"], data["misses"])
