@@ -55,7 +55,8 @@ def metric_lines() -> str:
 
 TOOL = {
     "name": "record_facts",
-    "description": "Record every qualifying fact found in the text.",
+    "description": "Record every qualifying fact found in the text. Call it once per request, with an empty list if there are none.",
+    "strict": True,
     "input_schema": {
         "type": "object",
         "properties": {
@@ -80,10 +81,12 @@ TOOL = {
                         "confidence": {"type": "number"},
                     },
                     "required": ["metric", "value", "unit", "period", "quote", "confidence"],
+                    "additionalProperties": False,
                 },
             }
         },
         "required": ["facts"],
+        "additionalProperties": False,
     },
 }
 
@@ -125,7 +128,7 @@ def build_prompt(meta: dict, chunk: str) -> str:
         f"Filing: {meta['form']} filed {meta['filing_date']}\n"
         f"Document: {meta.get('doc_type', '')} {meta.get('description', '')}\n\n"
         f"<text>\n{chunk}\n</text>\n\n"
-        "Record every qualifying fact with the record_facts tool."
+        "Call the record_facts tool exactly once with every qualifying fact (an empty list if there are none)."
     )
 
 
@@ -139,7 +142,9 @@ def call_model(client: Any, prompt: str, model: str | None = None, max_retries: 
                 max_tokens=4096,
                 system=system,
                 tools=[TOOL],
-                tool_choice={"type": "tool", "name": "record_facts"},
+                # Current models reject forced tool_choice ("tool"/"any"); the prompt asks for the call instead.
+                tool_choice={"type": "auto"},
+                output_config={"effort": config.ANTHROPIC_EFFORT},
                 messages=[{"role": "user", "content": prompt}],
             )
             for block in resp.content:

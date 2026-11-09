@@ -62,6 +62,8 @@ SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "")
 SEC_MAX_RPS = 8.0  # SEC fair-access limit is 10 requests per second
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+# Thinking effort for extraction: low | medium | high | xhigh | max. Low keeps a full run within a ~$20 budget.
+ANTHROPIC_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "low")
 
 # Metrics the extractor looks for. Units are canonical so values compare across filings.
 METRICS: dict[str, dict] = {

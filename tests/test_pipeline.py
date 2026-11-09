@@ -87,7 +87,8 @@ class FakeClaude:
 
     def create(self, **kw):
         self.calls += 1
-        assert kw["tool_choice"]["name"] == "record_facts"
+        assert kw["tool_choice"] == {"type": "auto"}
+        assert kw["tools"][0]["name"] == "record_facts"
         facts = [
             {"metric": "capex_guidance", "value": 20, "value_low": 18, "value_high": 22, "unit": "USD_billion",
              "period": "fiscal 2026", "change": "raised", "confidence": 0.95,

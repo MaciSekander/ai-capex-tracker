@@ -7,6 +7,8 @@ A dashboard of what hyperscalers, neoclouds and AI infrastructure companies disc
 - **Every extracted fact is checked.** It must carry a verbatim quote, and the pipeline confirms the quote appears in the filing and the number appears in the quote. Facts are marked verified, partial or unverified, and the dashboard can hide anything that isn't verified.
 - **Accuracy is measured.** A review workflow samples whole documents for a person to mark up, which gives precision and recall by metric. The Data quality tab shows both.
 
+For what each file does, how the checks work and how to browse the database, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Companies tracked
 
 Hyperscalers: Microsoft, Alphabet, Amazon, Meta, Oracle. Neoclouds: CoreWeave, Nebius, IREN. AI infrastructure: Applied Digital, Cipher Mining, TeraWulf, Hut 8, Core Scientific, Galaxy Digital. Edit `COMPANIES` in `tracker/config.py` to change the list.
